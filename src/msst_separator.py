@@ -489,6 +489,181 @@ def _to_numpy(tensor_or_array) -> np.ndarray:
 
 
 # ------------------------------------------------------------------
+# demix_linked_stft — chunk-level karaoke → dereverb entirely in STFT domain
+# ------------------------------------------------------------------
+
+def _demix_linked_stft(
+    config_k, model_k,   # karaoke: config + loaded model
+    config_d, model_d,   # dereverb: config + loaded model
+    mix: np.ndarray,     # (channels, samples) float32 audio
+    device: torch.device,
+) -> Dict[str, np.ndarray]:
+    """
+    Chained karaoke → dereverb separation entirely in the STFT domain.
+
+    Each audio chunk flows through:
+      1. Karaoke: audio → STFT → band_split → attention → mask → stft_vocals
+      2. STFT-domain residual: stft_instrumental = stft_original − stft_vocals
+      3. Dereverb: stft_vocals → band_split → attention → mask → stft_dry
+      4. STFT-domain residual: stft_reverb = stft_vocals − stft_dry
+      5. All three STFTs are iSTFT'd back to audio in one step
+      6. Windowed-accumulation (identical to stand-alone demix)
+
+    Returns dict mapping stem name → float32 numpy array (channels, samples).
+    """
+    import torch.nn.functional as F
+
+    # ── Chunk parameters (use karaoke's chunk_size for audio windowing) ──
+    chunk_size = int(config_k.inference.chunk_size)
+    num_overlap = int(config_k.inference.num_overlap)
+    step = chunk_size // num_overlap
+    fade_size = chunk_size // 10
+    border = chunk_size - step
+
+    # ── Convert audio to tensor ──
+    mix_t = torch.from_numpy(mix.astype(np.float32))
+    length_init = mix_t.shape[-1]
+
+    # ── Windowing array (mirrors demux / _getWindowingArray) ──
+    fadein = torch.linspace(0, 1, fade_size)
+    fadeout = torch.linspace(1, 0, fade_size)
+    windowing_array = torch.ones(chunk_size)
+    windowing_array[-fade_size:] = fadeout
+    windowing_array[:fade_size] = fadein
+
+    # ── Reflection pad (same as demux for generic mode) ──
+    if length_init > 2 * border and border > 0:
+        mix_t = F.pad(mix_t, (border, border), mode="reflect")
+
+    # ── Output buffers: 3 stems × N channels × padded_samples ──
+    num_out = 3  # noreverb(dry), Instrumental, reverb
+    result = torch.zeros((num_out,) + mix_t.shape, dtype=torch.float32)
+    counter = torch.zeros((num_out,) + mix_t.shape, dtype=torch.float32)
+
+    # ── Audio channel count ──
+    n_ch = mix_t.shape[0]  # 1 or 2
+
+    # ── Main loop: slide window across audio ──
+    i = 0
+    total_steps = 0
+    from tqdm import tqdm
+    pbar = tqdm(total=mix_t.shape[1], desc="Linked STFT demix", unit="samp", leave=False)
+
+    while i < mix_t.shape[1]:
+        # Extract chunk
+        part = mix_t[:, i:i + chunk_size].to(device)
+        chunk_len = part.shape[-1]
+        part = F.pad(part, (0, chunk_size - chunk_len))
+
+        # Add batch dim: (1, ch, samples)
+        audio_batch = part.unsqueeze(0)
+
+        with torch.no_grad():
+            # ═══════════════════════════════════════════════════════
+            # Step 1: Karaoke → vocals STFT
+            # ═══════════════════════════════════════════════════════
+            k_out = model_k(raw_audio=audio_batch, return_stft=True)
+            stft_voc = k_out['separated_stft']   # (1, 1, merged_f, T) complex
+            stft_orig = k_out['original_stft']    # (1, 1, merged_f, T) complex
+
+            # ═══════════════════════════════════════════════════════
+            # Step 2: Instrumental = original − vocals  (complex domain)
+            # ═══════════════════════════════════════════════════════
+            stft_inst = stft_orig - stft_voc      # (1, 1, merged_f, T) complex
+
+            # ═══════════════════════════════════════════════════════
+            # Step 3: Reshape vocals → dereverb stft_input format
+            #   karaoke output: (1, 1, freq×ch, T)  →  dereverb input: (1, ch, freq, T)
+            # ═══════════════════════════════════════════════════════
+            merged_f = stft_voc.shape[2]
+            freq_bins = merged_f // n_ch
+            stft_voc_d = stft_voc[:, 0, :, :].reshape(1, n_ch, freq_bins, -1)
+            # stft_voc_d: (1, ch, freq, T) complex
+
+            # ═══════════════════════════════════════════════════════
+            # Step 4: Dereverb on vocals STFT → dry STFT
+            # ═══════════════════════════════════════════════════════
+            d_out = model_d(
+                raw_audio=None,
+                stft_input=stft_voc_d,
+                stft_audio_length=chunk_size,
+                return_stft=True,
+            )
+            stft_dry = d_out['separated_stft']    # (1, 1, merged_f, T) complex
+
+            # ═══════════════════════════════════════════════════════
+            # Step 5: Reverb = vocals − dry  (complex domain)
+            # ═══════════════════════════════════════════════════════
+            stft_rev = stft_voc - stft_dry          # (1, 1, merged_f, T) complex
+
+            # ═══════════════════════════════════════════════════════
+            # Step 6: iSTFT all three stems → audio
+            #   Shape: (1, 1, freq×ch, T) → (ch, freq, T) → iSTFT → (ch, samples)
+            # ═══════════════════════════════════════════════════════
+            stft_window = k_out['stft_window'].to(device)
+            stft_kwargs = k_out['stft_kwargs']
+
+            def _istft_one(stft_complex, length):
+                """iSTFT a single-stem STFT tensor → audio."""
+                # stft_complex: (1, 1, freq×ch, T) → (ch, freq, T)
+                s = stft_complex[0, 0, :, :].reshape(n_ch, freq_bins, -1)  # (ch, freq, T)
+                audio = torch.istft(
+                    s, **stft_kwargs, window=stft_window,
+                    return_complex=False, length=length,
+                )
+                return audio  # (ch, samples) or (samples,) for mono
+
+            audio_dry = _istft_one(stft_dry, chunk_size)
+            audio_inst = _istft_one(stft_inst, chunk_size)
+            audio_rev = _istft_one(stft_rev, chunk_size)
+
+            # Ensure 2D: (ch, samples)
+            for aud in (audio_dry, audio_inst, audio_rev):
+                if aud.ndim == 1:
+                    aud = aud.unsqueeze(0)
+
+        # ═══════════════════════════════════════════════════════
+        # Step 7: Window and accumulate  (identical to demux logic)
+        # ═══════════════════════════════════════════════════════
+        window = windowing_array.clone()
+        if total_steps == 0:               # first chunk → no fade-in
+            window[:fade_size] = 1
+        if i + step >= mix_t.shape[1]:     # last chunk → no fade-out
+            window[-fade_size:] = 1
+
+        w = window[:chunk_len].unsqueeze(0)  # (1, chunk_len)
+
+        stems_audio = torch.stack([audio_dry, audio_inst, audio_rev], dim=0)
+        # stems_audio: (3, ch, chunk_len)
+
+        result[:, :, i:i + chunk_len] += stems_audio.cpu() * w.unsqueeze(1)
+        counter[:, :, i:i + chunk_len] += w.unsqueeze(1)
+
+        total_steps += 1
+        i += step
+        pbar.update(step)
+
+    pbar.close()
+
+    # ═══════════════════════════════════════════════════════
+    # Step 8: Normalize and trim padding
+    # ═══════════════════════════════════════════════════════
+    counter.clamp_(min=1e-8)
+    estimated = result / counter
+    estimated = estimated.cpu().numpy()
+    np.nan_to_num(estimated, copy=False, nan=0.0)
+
+    if length_init > 2 * border and border > 0:
+        estimated = estimated[..., border:border + length_init]
+
+    return {
+        'noreverb': estimated[0].astype(np.float32),       # dry vocals
+        'Instrumental': estimated[1].astype(np.float32),   # BGM + harmony
+        'reverb': estimated[2].astype(np.float32),         # reverb tail
+    }
+
+
+# ------------------------------------------------------------------
 # Linked MSST Separator — chained karaoke → dereverb with STFT pass-through
 # ------------------------------------------------------------------
 
@@ -562,90 +737,98 @@ class LinkedMSSTSeparator:
         output_sample_rate: int = 44100,
     ) -> Dict[str, Path]:
         """
-        Run karaoke → dereverb separation, keeping intermediate data in memory.
+        Run karaoke → dereverb separation.
 
-        Parameters
-        ----------
-        audio : np.ndarray
-            Original audio (channels, samples).
-        sample_rate : int
-            Sample rate of the input audio.
-        output_dir : Path
-            Directory for output files.
-        base_name : str
-            Base filename stem for output files.
-        output_sample_rate : int
-            Sample rate for output WAV files.
+        When STFT parameters are compatible, uses the fully STFT-domain pipeline:
+        each audio chunk goes through karaoke and dereverb in the complex
+        frequency domain without intermediate iSTFT.  Residual stems
+        (Instrumental, reverb) are computed via complex subtraction — exact
+        and lossless.
 
-        Returns
-        -------
-        dict
-            Mapping of stem_name → file_path for all saved stems.
+        Falls back to sequential separation when STFT params differ.
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         t0 = time.time()
 
-        # ---- Stage 1: Karaoke separation ----
-        logger.info("LinkedMSST Stage 1: Karaoke separation on original audio")
-        t1 = time.time()
-        karaoke_waveforms = self.karaoke.separate(audio, sample_rate, "Vocals")
-        vocals = karaoke_waveforms["Vocals"]  # numpy (ch, samples)
-        t_karaoke = time.time() - t1
-        logger.info("Karaoke separation: %.1fs", t_karaoke)
-
-        # Save vocals
-        vocals_path = output_dir / f"{base_name}_Vocals.wav"
-        sf.write(str(vocals_path), vocals.T, output_sample_rate, format="WAV", subtype="FLOAT")
-        saved = {"Vocals": vocals_path}
-
-        # ---- Stage 2: Dereverb separation (from in-memory vocals) ----
-        logger.info("LinkedMSST Stage 2: Dereverb separation on vocals (in-memory)")
-        t2 = time.time()
-        dereverb_waveforms = self.dereverb.separate(vocals, sample_rate, "noreverb")
-        noreverb = dereverb_waveforms["noreverb"]  # numpy (ch, samples)
-        t_dereverb = time.time() - t2
-        logger.info("Dereverb separation: %.1fs", t_dereverb)
-
-        # Save noreverb (dry vocals)
-        noreverb_path = output_dir / f"{base_name}_Vocals_noreverb.wav"
-        sf.write(str(noreverb_path), noreverb.T, output_sample_rate, format="WAV", subtype="FLOAT")
-        saved["noreverb"] = noreverb_path
-
-        # ---- Stage 3: Compute residuals in STFT domain ----
-        logger.info("LinkedMSST Stage 3: STFT-domain residual computation")
-        t3 = time.time()
+        # Resample if needed
+        model_sr = int(self.karaoke._config.audio.sample_rate)
+        if sample_rate != model_sr:
+            audio = _resample_fast(audio, sample_rate, model_sr)
+            sample_rate = model_sr
 
         if self._stft_compatible:
+            # ═══════════════════════════════════════════════════════
+            # Fast path: full STFT-domain pipeline
+            # ═══════════════════════════════════════════════════════
+            logger.info(
+                "LinkedMSST: Using FULL STFT-DOMAIN pipeline "
+                "(karaoke → STFT → dereverb → iSTFT)"
+            )
+            waveforms = _demix_linked_stft(
+                config_k=self.karaoke._config,
+                model_k=self.karaoke._model,
+                config_d=self.dereverb._config,
+                model_d=self.dereverb._model,
+                mix=audio,
+                device=self.device,
+            )
+            # waveforms: {'noreverb', 'Instrumental', 'reverb'}
+            # We also need 'Vocals' — compute from original - instrumental
+            # in time domain (simple numpy subtraction, no librosa needed)
+            min_len = min(audio.shape[-1], waveforms['Instrumental'].shape[-1])
+            vocals = audio[:, :min_len] - waveforms['Instrumental'][:, :min_len]
+            waveforms['Vocals'] = vocals.astype(np.float32)
+            t_total = time.time() - t0
+            logger.info("LinkedMSST (full-STFT): %.1fs total", t_total)
+
+        else:
+            # ═══════════════════════════════════════════════════════
+            # Fallback: sequential separation + STFT-domain residuals
+            # ═══════════════════════════════════════════════════════
+            logger.info("LinkedMSST: Using sequential fallback (STFT params differ)")
+            t1 = time.time()
+            karaoke_waveforms = self.karaoke.separate(audio, sample_rate, "Vocals")
+            vocals = karaoke_waveforms["Vocals"]
+            t_karaoke = time.time() - t1
+
+            t2 = time.time()
+            dereverb_waveforms = self.dereverb.separate(vocals, sample_rate, "noreverb")
+            noreverb = dereverb_waveforms["noreverb"]
+            t_dereverb = time.time() - t2
+
             instrumental, reverb = self._compute_residuals_stft(
                 audio, vocals, noreverb, sample_rate,
             )
-        else:
-            # Fallback: time-domain subtraction
-            instrumental = audio - vocals
-            # Align lengths
-            min_len = min(vocals.shape[-1], noreverb.shape[-1])
-            reverb = vocals[:, :min_len] - noreverb[:, :min_len]
+            waveforms = {
+                'Vocals': vocals,
+                'noreverb': noreverb,
+                'Instrumental': instrumental,
+                'reverb': reverb,
+            }
+            t_total = time.time() - t0
+            logger.info("LinkedMSST (fallback): %.1fs (karaoke=%.1fs, dereverb=%.1fs)",
+                         t_total, t_karaoke, t_dereverb)
 
-        t_residual = time.time() - t3
-        logger.info("Residual computation: %.1fs", t_residual)
-
-        # Save instrumental
-        instrumental_path = output_dir / f"{base_name}_Instrumental.wav"
-        sf.write(str(instrumental_path), instrumental.T, output_sample_rate,
-                 format="WAV", subtype="FLOAT")
-        saved["Instrumental"] = instrumental_path
-
-        # Save reverb
-        reverb_path = output_dir / f"{base_name}_Vocals_reverb.wav"
-        sf.write(str(reverb_path), reverb.T, output_sample_rate,
-                 format="WAV", subtype="FLOAT")
-        saved["reverb"] = reverb_path
-
-        t_total = time.time() - t0
-        logger.info("LinkedMSST total: %.1fs (karaoke=%.1fs, dereverb=%.1fs, residual=%.1fs)",
-                     t_total, t_karaoke, t_dereverb, t_residual)
+        # ---- Save all stems ----
+        saved = {}
+        stem_names = [
+            ("Vocals", "{}_Vocals.wav"),
+            ("noreverb", "{}_Vocals_noreverb.wav"),
+            ("Instrumental", "{}_Instrumental.wav"),
+            ("reverb", "{}_Vocals_reverb.wav"),
+        ]
+        for stem_key, filename in stem_names:
+            wav = waveforms.get(stem_key)
+            if wav is None:
+                continue
+            out_path = output_dir / filename.format(base_name)
+            sf.write(str(out_path), wav.T, output_sample_rate,
+                     format="WAV", subtype="FLOAT")
+            saved[stem_key] = out_path
+            duration = wav.shape[-1] / output_sample_rate
+            logger.info("Saved: %s (%.1fs)", out_path.name, duration)
 
         return saved
 

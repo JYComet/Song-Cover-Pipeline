@@ -1,0 +1,60 @@
+extract_audio:
+  enabled: true
+  sample_rate: 44100
+harmony_separation:
+  checkpoint_path: models/MSST/bs_roformer_karaoke_frazer_becruily.ckpt
+  chunk_batch: 16
+  config_path: vendor/msst/configs/config_karaoke_frazer_becruily_chunksize_test.yaml
+  device: cuda:0
+  enabled: true
+  model_type: bs_roformer
+  msst_code_dir: vendor/msst
+  other_stems:
+  - Instrumental
+  output_sample_rate: 44100
+  target_stem: Vocals
+linked_separation:
+  enabled: false
+mixing:
+  enabled: true
+  instrumental_gain: 0.0
+  normalize_output: true
+  output_format: wav
+  output_sample_rate: 44100
+  reverb_gain: -3.0
+  vocal_gain: 0.0
+reverb_separation:
+  checkpoint_path: models/MSST/dereverb_bs_roformer_anvuew_sdr_22.5050.ckpt
+  chunk_batch: 16
+  config_path: vendor/msst/configs/dereverb_bs_roformer_anvuew.yaml
+  device: cuda:0
+  enabled: true
+  model_type: bs_roformer
+  msst_code_dir: vendor/msst
+  other_stems:
+  - reverb
+  output_sample_rate: 44100
+  target_stem: noreverb
+task:
+  input_song: input/《锁R＆B》.mp4
+  name: paipai音色翻唱-锁R&B
+  output_dir: output/锁R&B_chunksize_test
+timbre_conversion:
+  ddsp_project_dir: vendor/ddsp
+  device: cuda:0
+  enabled: true
+  f0_max: 800
+  f0_min: 65
+  formant_shift: 0
+  infer_step: 100
+  key: 0
+  method: euler
+  model_ckpt: models/DDSP/paipai.pt
+  pitch_extractor: rmvpe
+  segment_batch_size: 1
+  spk_id: 1
+  t_start: 0.4
+  threshold: -60
+  use_amp: false
+  use_compile: false
+  vocal_register_shift: 0
