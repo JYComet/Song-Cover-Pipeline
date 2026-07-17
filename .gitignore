@@ -4,11 +4,15 @@ __pycache__/
 *.pyo
 
 # Model checkpoints (too large for git — managed separately)
+*.pt
 models/
 vendor/ddsp/pretrain/
 
 # Pipeline output
 output/
+
+# Web UI uploads (user data — managed separately)
+webui/uploads/
 
 # Pipeline checkpoint (generated at runtime)
 .pipeline_checkpoint.json

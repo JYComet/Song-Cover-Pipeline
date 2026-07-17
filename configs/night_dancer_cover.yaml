@@ -1,0 +1,72 @@
+# =============================================================================
+# Song Cover Pipeline — Night Dancer 翻唱
+# =============================================================================
+
+task:
+  name: "Night Dancer 翻唱"
+  input_song: "output/NightDancer/00_extract_audio/⚡全网催更的完整版来了！『Night Dancer』慵懒女声翻唱.wav"
+  output_dir: "output/NightDancer"
+
+extract_audio:
+  enabled: true
+  sample_rate: 44100
+
+linked_separation:
+  enabled: true
+
+harmony_separation:
+  enabled: true
+  msst_code_dir: "vendor/msst"
+  model_type: "bs_roformer"
+  config_path: "vendor/msst/configs/config_karaoke_frazer_becruily.yaml"
+  checkpoint_path: "models/MSST/bs_roformer_karaoke_frazer_becruily.ckpt"
+  target_stem: "Vocals"
+  other_stems:
+    - "Instrumental"
+  device: "cuda:0"
+  chunk_batch: 32
+  output_sample_rate: 44100
+  use_compile: true
+
+reverb_separation:
+  enabled: true
+  msst_code_dir: "vendor/msst"
+  model_type: "bs_roformer"
+  config_path: "vendor/msst/configs/dereverb_bs_roformer_anvuew.yaml"
+  checkpoint_path: "models/MSST/dereverb_bs_roformer_anvuew_sdr_22.5050.ckpt"
+  target_stem: "noreverb"
+  other_stems:
+    - "reverb"
+  device: "cuda:0"
+  chunk_batch: 16
+  output_sample_rate: 44100
+  use_compile: true
+
+timbre_conversion:
+  enabled: true
+  ddsp_project_dir: "vendor/ddsp"
+  model_ckpt: "models/DDSP/日语ria.pt"
+  device: "cuda:0"
+  infer_step: 100
+  t_start: 0.4
+  method: "euler"
+  pitch_extractor: "rmvpe"
+  key: 0
+  vocal_register_shift: 0
+  formant_shift: 0
+  f0_min: 65
+  f0_max: 800
+  threshold: -60
+  spk_id: 1
+  use_compile: false
+  use_amp: false
+  segment_batch_size: 1
+
+mixing:
+  enabled: true
+  vocal_gain: 0.0
+  instrumental_gain: 0.0
+  reverb_gain: -3.0
+  normalize_output: true
+  output_format: "wav"
+  output_sample_rate: 44100

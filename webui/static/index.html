@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Song Cover Pipeline</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='28' font-size='28'>🎵</text></svg>">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="header-left">
+            <h1 class="logo">🎵 Song Cover Pipeline</h1>
+            <span class="subtitle">AI 歌曲翻唱管线</span>
+        </div>
+        <div class="header-right">
+            <span id="disk-badge" class="badge" title="Disk usage">💾 --</span>
+            <span id="gpu-badge" class="badge" title="GPU status">⏳ Checking...</span>
+            <span id="server-status" class="status-dot" title="Server status"></span>
+        </div>
+    </header>
+
+    <!-- Main Layout -->
+    <div class="main-container">
+
+        <!-- Sidebar: Configuration -->
+        <aside class="sidebar" id="sidebar">
+            <!-- Upload — primary action first -->
+            <div class="upload-section">
+                <div class="upload-zone" id="upload-zone">
+                    <div class="upload-icon">🎶</div>
+                    <p class="upload-text">拖拽音频/视频文件到此处</p>
+                    <p class="upload-hint">支持 WAV, MP3, FLAC, MP4, MKV 等格式</p>
+                    <input type="file" id="file-input" accept="audio/*,video/*" hidden>
+                    <button type="button" class="btn btn-secondary" id="btn-browse">选择文件</button>
+                </div>
+                <div class="upload-info" id="upload-info" style="display:none;">
+                    <span class="file-icon">✅</span>
+                    <span id="upload-filename"></span>
+                    <span class="file-size" id="upload-size"></span>
+                    <button class="btn-icon" id="btn-clear-file" title="清除">✕</button>
+                </div>
+            </div>
+
+            <!-- Start button -->
+            <button type="button" class="btn btn-primary btn-block" id="btn-start" disabled>
+                🚀 开始处理
+            </button>
+
+            <!-- Divider -->
+            <hr class="sidebar-divider">
+
+            <!-- Configuration section -->
+            <h2 class="sidebar-title">⚙️ 配置参数</h2>
+
+            <!-- Model Selection -->
+            <div class="form-group">
+                <label for="model-select">🎤 音色模型 <span class="required">*</span></label>
+                <select id="model-select" class="form-select">
+                    <option value="">加载中...</option>
+                </select>
+                <small class="form-hint">选择要替换的目标人声模型</small>
+            </div>
+
+            <!-- Basic Parameters -->
+            <fieldset class="param-section">
+                <legend>基本参数</legend>
+
+                <div class="form-group">
+                    <label for="param-key">
+                        音高偏移 (Key)
+                        <span class="param-value" id="val-key">0</span> semitones
+                    </label>
+                    <input type="range" id="param-key" class="form-range" min="-12" max="12" value="0" step="1">
+                    <small class="form-hint">正值升高音调，负值降低音调</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="param-infer_step">
+                        推理步数 (Infer Steps)
+                        <span class="param-value" id="val-infer_step">100</span>
+                    </label>
+                    <input type="range" id="param-infer_step" class="form-range" min="10" max="200" value="100" step="10">
+                    <small class="form-hint">步数越多质量越高，但速度越慢 (40-60 通常足够)</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="param-t_start">
+                        浮动 (T-Start)
+                        <span class="param-value" id="val-t_start">0.4</span>
+                    </label>
+                    <input type="range" id="param-t_start" class="form-range" min="0" max="1.0" value="0.4" step="0.05">
+                    <small class="form-hint">0=纯扩散, 1=纯DDSP, 默认0.4取得良好平衡</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="param-method">ODE 求解器</label>
+                    <select id="param-method" class="form-select">
+                        <option value="euler">euler (更快)</option>
+                        <option value="rk4">rk4 (更精确)</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label for="param-pitch_extractor">F0 提取器</label>
+                    <select id="param-pitch_extractor" class="form-select">
+                        <option value="fcpe">fcpe (GPU, 推荐)</option>
+                        <option value="rmvpe">rmvpe</option>
+                        <option value="parselmouth">parselmouth</option>
+                        <option value="dio">dio</option>
+                        <option value="harvest">harvest</option>
+                        <option value="crepe">crepe</option>
+                    </select>
+                </div>
+            </fieldset>
+
+            <!-- Advanced Parameters (collapsible) -->
+            <details class="param-section advanced-toggle" id="advanced-toggle">
+                <summary>🔧 高级参数</summary>
+
+                <div class="form-group">
+                    <label for="param-vocal_gain">
+                        人声音量
+                        <span class="param-value" id="val-vocal_gain">0.0</span> dB
+                    </label>
+                    <input type="range" id="param-vocal_gain" class="form-range" min="-12" max="12" value="0" step="0.5">
+                </div>
+
+                <div class="form-group">
+                    <label for="param-instrumental_gain">
+                        伴奏音量
+                        <span class="param-value" id="val-instrumental_gain">0.0</span> dB
+                    </label>
+                    <input type="range" id="param-instrumental_gain" class="form-range" min="-12" max="12" value="0" step="0.5">
+                </div>
+
+                <div class="form-group">
+                    <label for="param-reverb_gain">
+                        混响音量
+                        <span class="param-value" id="val-reverb_gain">-3.0</span> dB
+                    </label>
+                    <input type="range" id="param-reverb_gain" class="form-range" min="-24" max="6" value="-3" step="0.5">
+                </div>
+
+                <div class="form-group">
+                    <label for="param-formant_shift">
+                        共振峰偏移
+                        <span class="param-value" id="val-formant_shift">0</span>
+                    </label>
+                    <input type="range" id="param-formant_shift" class="form-range" min="-12" max="12" value="0" step="1">
+                </div>
+
+                <div class="form-group checkbox-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="param-use_compile" checked>
+                        <span>torch.compile 加速 (MSST和声+混响分离, 提升20-40%)</span>
+                    </label>
+                </div>
+
+                <div class="form-group checkbox-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="param-normalize_output" checked>
+                        <span>输出峰值归一化</span>
+                    </label>
+                </div>
+
+                <div class="form-group checkbox-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="param-keep_intermediates">
+                        <span>保留中间文件 (调试用，会占用大量磁盘)</span>
+                    </label>
+                </div>
+
+                <div class="form-group">
+                    <label for="param-segment_batch_size">
+                        批处理大小: <span class="param-value" id="val-segment_batch_size">1</span>
+                    </label>
+                    <input type="range" id="param-segment_batch_size" class="form-range" min="1" max="8" value="1" step="1">
+                    <small class="form-hint">DDSP 每批处理的音频片段数 (增大可提升GPU利用率)</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="param-chunk_batch_harmony">
+                        和声分离批大小: <span class="param-value" id="val-chunk_batch_harmony">16</span>
+                    </label>
+                    <input type="range" id="param-chunk_batch_harmony" class="form-range" min="1" max="32" value="16" step="1">
+                    <small class="form-hint">MSST karaoke 推理批大小 (VRAM充足可调高加速)</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="param-chunk_batch_reverb">
+                        混响分离批大小: <span class="param-value" id="val-chunk_batch_reverb">8</span>
+                    </label>
+                    <input type="range" id="param-chunk_batch_reverb" class="form-range" min="1" max="32" value="8" step="1">
+                    <small class="form-hint">MSST dereverb 推理批大小</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="param-f0_min">
+                        最低音高 (F0 Min): <span class="param-value" id="val-f0_min">65</span> Hz
+                    </label>
+                    <input type="range" id="param-f0_min" class="form-range" min="30" max="200" value="65" step="5">
+                    <small class="form-hint">人声最低频率 (默认65≈C2, 男低音可降至40)</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="param-f0_max">
+                        最高音高 (F0 Max): <span class="param-value" id="val-f0_max">800</span> Hz
+                    </label>
+                    <input type="range" id="param-f0_max" class="form-range" min="200" max="1200" value="800" step="10">
+                    <small class="form-hint">人声最高频率 (默认800≈G5, 女高音可升至1000+)</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="param-threshold">
+                        静音阈值: <span class="param-value" id="val-threshold">-60</span> dB
+                    </label>
+                    <input type="range" id="param-threshold" class="form-range" min="-80" max="-20" value="-60" step="5">
+                    <small class="form-hint">低于此电平的帧将被静音 (更负=更激进)</small>
+                </div>
+            </details>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="content" id="main-content">
+            <!-- Welcome / Idle State -->
+            <div class="welcome" id="welcome-state">
+                <div class="welcome-icon">🎧</div>
+                <h2>Song Cover Pipeline</h2>
+                <p>选择一个音色模型，上传一首歌曲，然后点击"开始处理"</p>
+                <div class="pipeline-flow">
+                    <div class="flow-step">
+                        <span class="flow-num">1</span>
+                        <span>和声分离</span>
+                    </div>
+                    <span class="flow-arrow">→</span>
+                    <div class="flow-step">
+                        <span class="flow-num">2</span>
+                        <span>混响分离</span>
+                    </div>
+                    <span class="flow-arrow">→</span>
+                    <div class="flow-step">
+                        <span class="flow-num">3</span>
+                        <span>音色替换</span>
+                    </div>
+                    <span class="flow-arrow">→</span>
+                    <div class="flow-step">
+                        <span class="flow-num">4</span>
+                        <span>混音输出</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Processing State -->
+            <div class="processing" id="processing-state" style="display:none;">
+                <h2>⏳ 处理中...</h2>
+                <div class="progress-container">
+                    <div class="progress-bar-bg">
+                        <div class="progress-bar-fill" id="progress-fill" style="width:0%"></div>
+                    </div>
+                    <div class="progress-text">
+                        <span id="progress-percent">0%</span>
+                        <span id="progress-stage"></span>
+                    </div>
+                    <p class="progress-message" id="progress-message">正在初始化...</p>
+                </div>
+                <div class="stage-indicators" id="stage-indicators">
+                    <div class="stage-dot" data-stage="extract_audio">音频提取</div>
+                    <div class="stage-dot" data-stage="harmony_separation">和声分离</div>
+                    <div class="stage-dot" data-stage="reverb_separation">混响分离</div>
+                    <div class="stage-dot" data-stage="timbre_conversion">音色替换</div>
+                    <div class="stage-dot" data-stage="mixing">混音输出</div>
+                </div>
+            </div>
+
+            <!-- Results State -->
+            <div class="results" id="results-state" style="display:none;">
+                <h2>✅ 处理完成!</h2>
+                <div class="audio-player-container">
+                    <div class="audio-player">
+                        <button class="btn-play" id="btn-play">▶</button>
+                        <div class="audio-waveform" id="waveform">
+                            <canvas id="waveform-canvas"></canvas>
+                        </div>
+                        <audio id="audio-player" preload="auto"></audio>
+                    </div>
+                    <div class="audio-controls">
+                        <span class="audio-time" id="audio-current">0:00</span>
+                        <input type="range" class="audio-seek" id="audio-seek" value="0" min="0" max="100">
+                        <span class="audio-time" id="audio-duration">0:00</span>
+                        <span class="audio-volume-icon">🔊</span>
+                        <input type="range" class="audio-volume" id="audio-volume" value="80" min="0" max="100">
+                    </div>
+                </div>
+                <div class="result-actions">
+                    <button class="btn btn-primary" id="btn-download">💾 下载翻唱</button>
+                    <button class="btn btn-secondary" id="btn-show-log">📋 查看日志</button>
+                    <button class="btn btn-secondary" id="btn-new-task">🔄 重新开始</button>
+                </div>
+                <div class="output-files" id="output-files-list" style="display:none;">
+                    <h4>📂 中间文件</h4>
+                    <div id="output-links"></div>
+                </div>
+                <div class="log-viewer" id="log-viewer-results" style="display:none;">
+                    <div class="log-viewer-header">
+                        <h4>📋 任务日志</h4>
+                        <button class="btn-icon" id="btn-close-log-results" title="关闭">✕</button>
+                    </div>
+                    <pre class="log-content" id="log-content-results">加载中...</pre>
+                </div>
+            </div>
+
+            <!-- Error State -->
+            <div class="error-state" id="error-state" style="display:none;">
+                <h2>❌ 处理失败</h2>
+                <p class="error-message" id="error-message"></p>
+                <button class="btn btn-secondary" id="btn-show-error-log">📋 查看错误日志</button>
+                <button class="btn btn-secondary" id="btn-retry">🔄 重试</button>
+                <div class="log-viewer" id="log-viewer-error" style="display:none;">
+                    <div class="log-viewer-header">
+                        <h4>📋 错误日志</h4>
+                        <button class="btn-icon" id="btn-close-log-error" title="关闭">✕</button>
+                    </div>
+                    <pre class="log-content" id="log-content-error">加载中...</pre>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Toast Container -->
+    <div class="toast-container" id="toast-container"></div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,62 @@
+extract_audio:
+  enabled: true
+  sample_rate: 44100
+harmony_separation:
+  checkpoint_path: models/MSST/bs_roformer_karaoke_frazer_becruily.ckpt
+  chunk_batch: 32
+  config_path: vendor/msst/configs/config_karaoke_frazer_becruily.yaml
+  device: cuda:0
+  enabled: true
+  model_type: bs_roformer
+  msst_code_dir: vendor/msst
+  other_stems:
+  - Instrumental
+  output_sample_rate: 44100
+  target_stem: Vocals
+  use_compile: true
+linked_separation:
+  enabled: true
+mixing:
+  enabled: true
+  instrumental_gain: 0.0
+  normalize_output: true
+  output_format: wav
+  output_sample_rate: 44100
+  reverb_gain: -3.0
+  vocal_gain: 0.0
+reverb_separation:
+  checkpoint_path: models/MSST/dereverb_bs_roformer_anvuew_sdr_22.5050.ckpt
+  chunk_batch: 16
+  config_path: vendor/msst/configs/dereverb_bs_roformer_anvuew.yaml
+  device: cuda:0
+  enabled: true
+  model_type: bs_roformer
+  msst_code_dir: vendor/msst
+  other_stems:
+  - reverb
+  output_sample_rate: 44100
+  target_stem: noreverb
+  use_compile: true
+task:
+  input_song: /mnt/local_E/B站下载/屏幕前的你_原曲.wav
+  name: 屏幕前的你 +2key
+  output_dir: output/屏幕前的你_升2key
+timbre_conversion:
+  ddsp_project_dir: vendor/ddsp
+  device: cuda:0
+  enabled: true
+  f0_max: 800
+  f0_min: 65
+  formant_shift: 0
+  infer_step: 100
+  key: 2
+  method: euler
+  model_ckpt: models/DDSP/paipai.pt
+  pitch_extractor: rmvpe
+  segment_batch_size: 1
+  spk_id: 1
+  t_start: 0.4
+  threshold: -60
+  use_amp: false
+  use_compile: false
+  vocal_register_shift: 0

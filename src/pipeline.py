@@ -18,7 +18,7 @@ import sys
 import time
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 # Configure logging
 logging.basicConfig(
@@ -74,15 +74,32 @@ class SongCoverPipeline:
     # Public: run the full pipeline
     # ------------------------------------------------------------------
 
-    def run(self) -> dict:
+    def run(self, progress_callback: Optional[Callable] = None) -> dict:
         """
         Execute all enabled pipeline stages in order.
+
+        Parameters
+        ----------
+        progress_callback : callable or None
+            Optional callback for progress reporting.
+            Signature: callback(stage: str, status: str, percent: float, message: str)
+            - stage: stage key (e.g. "harmony_separation", "timbre_conversion")
+            - status: "started", "progress", "completed", "error"
+            - percent: 0.0–100.0 overall progress
+            - message: human-readable description
 
         Returns
         -------
         dict
             Summary of results including output file paths and timings.
         """
+        def _progress(stage, status, percent, message):
+            if progress_callback:
+                try:
+                    progress_callback(stage, status, percent, message)
+                except Exception:
+                    pass  # never let callback failures break the pipeline
+
         results = {
             "task_name": self.task_name,
             "stages": {},
@@ -92,13 +109,18 @@ class SongCoverPipeline:
         try:
             # Stage 0: Extract audio from video (if needed)
             if self._stage_enabled("extract_audio"):
+                _progress("extract_audio", "started", 0.0, "Extracting audio from input...")
                 results["stages"]["extract_audio"] = self._run_extract_audio()
+                _progress("extract_audio", "completed", 5.0, "Audio extraction complete")
 
             # Check if linked separation is enabled (runs karaoke+dereverb in one shot)
             linked_cfg = self.config.get("linked_separation", {})
             if linked_cfg.get("enabled", False):
                 # Stages 1+2: Linked karaoke → dereverb (GPU memory pass-through)
-                linked_result = self._run_linked_separation()
+                _progress("linked_separation", "started", 5.0,
+                          "加载和声分离模型 (~200MB), 首次运行需稍等...")
+                linked_result = self._run_linked_separation(progress_callback=progress_callback)
+                _progress("linked_separation", "completed", 45.0, "和声+混响分离完成")
                 results["stages"]["linked_separation"] = linked_result
                 results["stages"]["harmony_separation"] = {
                     "status": "completed (via linked)",
@@ -113,23 +135,37 @@ class SongCoverPipeline:
             else:
                 # Stage 1: Harmony separation (standalone)
                 if self._stage_enabled("harmony_separation"):
+                    _progress("harmony_separation", "started", 5.0,
+                              "加载和声分离模型 (~200MB), 首次运行需稍等...")
                     results["stages"]["harmony_separation"] = self._run_harmony_separation()
+                    _progress("harmony_separation", "completed", 25.0, "和声分离完成, 人声+伴奏已分离")
 
                 # Stage 2: Reverb separation (standalone)
                 if self._stage_enabled("reverb_separation"):
+                    _progress("reverb_separation", "started", 25.0,
+                              "加载混响分离模型 (~200MB), 首次运行需稍等...")
                     results["stages"]["reverb_separation"] = self._run_reverb_separation()
+                    _progress("reverb_separation", "completed", 45.0, "混响分离完成, 干声+混响尾已分离")
 
             # Stage 3: Timbre conversion
             if self._stage_enabled("timbre_conversion"):
-                results["stages"]["timbre_conversion"] = self._run_timbre_conversion()
+                _progress("timbre_conversion", "started", 45.0,
+                          "加载DDSP音色模型 (~210MB), 首次运行需稍等...")
+                results["stages"]["timbre_conversion"] = self._run_timbre_conversion(
+                    progress_callback=progress_callback
+                )
+                _progress("timbre_conversion", "completed", 90.0, "音色替换完成!")
 
             # Stage 4: Final mix
             if self._stage_enabled("mixing"):
+                _progress("mixing", "started", 90.0, "Final mixing...")
                 results["stages"]["mixing"] = self._run_mixing()
+                _progress("mixing", "completed", 100.0, "Pipeline complete!")
 
         except Exception as exc:
             logger.error("Pipeline failed: %s", exc, exc_info=True)
             results["error"] = str(exc)
+            _progress("error", "error", -1, str(exc))
             raise
 
         finally:
@@ -149,7 +185,7 @@ class SongCoverPipeline:
     # ------------------------------------------------------------------
 
     # Supported video extensions for audio extraction
-    _VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".wmv", ".m4v"}
+    _VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".wmv", ".m4v", ".m4a"}
 
     def _run_extract_audio(self) -> dict:
         """Stage 0: Extract audio from video if the input is a video file.
@@ -242,7 +278,7 @@ class SongCoverPipeline:
             checkpoint_path=stage_cfg["checkpoint_path"],
             device=stage_cfg.get("device", "cuda:0"),
             chunk_batch=stage_cfg.get("chunk_batch", 16),
-            use_compile=stage_cfg.get("use_compile", False),
+            use_compile=stage_cfg.get("use_compile", True),
         )
 
         try:
@@ -323,7 +359,7 @@ class SongCoverPipeline:
             checkpoint_path=stage_cfg["checkpoint_path"],
             device=stage_cfg.get("device", "cuda:0"),
             chunk_batch=stage_cfg.get("chunk_batch", 8),
-            use_compile=stage_cfg.get("use_compile", False),
+            use_compile=stage_cfg.get("use_compile", True),
         )
 
         try:
@@ -371,7 +407,7 @@ class SongCoverPipeline:
         finally:
             separator.unload_model()
 
-    def _run_linked_separation(self) -> dict:
+    def _run_linked_separation(self, progress_callback: Optional[Callable] = None) -> dict:
         """
         Stages 1+2 combined: Karaoke → Dereverb with in-memory data passing.
 
@@ -386,6 +422,12 @@ class SongCoverPipeline:
           - GPU memory bandwidth contention (only 1 model on GPU at a time)
           - librosa-based residual computation (replaced by STFT-domain)
         """
+        def _p(stage, status, pct, msg):
+            if progress_callback:
+                try:
+                    progress_callback(stage, status, pct, msg)
+                except Exception:
+                    pass
         karaoke_cfg = self.config["harmony_separation"]
         dereverb_cfg = self.config["reverb_separation"]
 
@@ -409,6 +451,13 @@ class SongCoverPipeline:
             audio = audio.T  # (samples, ch) → (ch, samples)
         audio = audio.astype(np.float32)
         sample_rate_out = karaoke_cfg.get("output_sample_rate", 44100)
+
+        # Resample original audio to target rate if needed (for STFT residual alignment)
+        if sr != sample_rate_out:
+            logger.info("Resampling original from %d Hz to %d Hz", sr, sample_rate_out)
+            from src.msst_separator import _resample_fast
+            audio = _resample_fast(audio, sr, sample_rate_out)
+            sr = sample_rate_out
         stage_dir_1 = self.output_dir / "01_harmony_separation"
         stage_dir_1.mkdir(parents=True, exist_ok=True)
         base_name = self.input_song.stem
@@ -424,10 +473,11 @@ class SongCoverPipeline:
             checkpoint_path=karaoke_cfg["checkpoint_path"],
             device=karaoke_cfg.get("device", "cuda:0"),
             chunk_batch=karaoke_cfg.get("chunk_batch", 16),
-            use_compile=karaoke_cfg.get("use_compile", False),
+            use_compile=karaoke_cfg.get("use_compile", True),
         )
         try:
             karaoke.load_model()
+            _p("linked_separation", "progress", 8.0, "和声分离中...")
             karaoke_waveforms = karaoke.separate(audio, sr, "Vocals")
             vocals = karaoke_waveforms["Vocals"]  # numpy (ch, samples) — kept in RAM
         finally:
@@ -441,6 +491,7 @@ class SongCoverPipeline:
         # ==================================================================
         # Phase 2: Dereverb separation on in-memory vocals
         # ==================================================================
+        _p("linked_separation", "progress", 15.0, "加载混响分离模型 (~200MB)...")
         logger.info("--- Phase 2: Dereverb separation (in-memory) ---")
         dereverb = MSSTSeparator(
             msst_code_dir=dereverb_cfg["msst_code_dir"],
@@ -449,10 +500,11 @@ class SongCoverPipeline:
             checkpoint_path=dereverb_cfg["checkpoint_path"],
             device=dereverb_cfg.get("device", "cuda:0"),
             chunk_batch=dereverb_cfg.get("chunk_batch", 8),
-            use_compile=dereverb_cfg.get("use_compile", False),
+            use_compile=dereverb_cfg.get("use_compile", True),
         )
         try:
             dereverb.load_model()
+            _p("linked_separation", "progress", 25.0, "混响分离中...")
             dereverb_waveforms = dereverb.separate(vocals, sr, "noreverb")
             noreverb = dereverb_waveforms["noreverb"]  # numpy (ch, samples)
         finally:
@@ -495,7 +547,7 @@ class SongCoverPipeline:
         self._mark_stage_done("02_reverb_separation")
         return result
 
-    def _run_timbre_conversion(self) -> dict:
+    def _run_timbre_conversion(self, progress_callback: Optional[Callable] = None) -> dict:
         """Stage 3: Convert vocal timbre using DDSP-SVC."""
         stage_cfg = self.config["timbre_conversion"]
         stage_name = "03_timbre_conversion"
@@ -527,8 +579,8 @@ class SongCoverPipeline:
             device=stage_cfg.get("device", "cuda:0"),
             infer_step=stage_cfg.get("infer_step", 100),
             t_start=stage_cfg.get("t_start", 0.4),
-            method=stage_cfg.get("method", "euler"),
-            pitch_extractor=stage_cfg.get("pitch_extractor", "rmvpe"),
+            method=stage_cfg.get("method", "rk4"),
+            pitch_extractor=stage_cfg.get("pitch_extractor", "fcpe"),
             key=stage_cfg.get("key", 0),
             vocal_register_shift=stage_cfg.get("vocal_register_shift", 0),
             formant_shift=stage_cfg.get("formant_shift", 0),
@@ -537,7 +589,7 @@ class SongCoverPipeline:
             threshold=stage_cfg.get("threshold", -60),
             spk_id=stage_cfg.get("spk_id", 1),
             # Performance tuning
-            use_compile=stage_cfg.get("use_compile", False),
+            use_compile=stage_cfg.get("use_compile", False),   # DDSP: crashes on this system
             use_amp=stage_cfg.get("use_amp", False),
             segment_batch_size=stage_cfg.get("segment_batch_size", 1),
         )
@@ -552,6 +604,7 @@ class SongCoverPipeline:
             converter.convert(
                 input_path=dry_vocals_file,
                 output_path=output_file,
+                progress_callback=progress_callback,
             )
 
             result = {

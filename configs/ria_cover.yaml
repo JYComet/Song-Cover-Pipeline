@@ -28,7 +28,7 @@ extract_audio:
 # reverb) are computed in STFT domain for higher precision and speed.
 # =============================================================================
 linked_separation:
-  enabled: false                # Set to true to enable the linked fast path
+  enabled: true                 # GPU memory pass-through + STFT-domain residuals
 
 # =============================================================================
 # Stage 1: Harmony Separation (和声分离)
@@ -61,6 +61,7 @@ harmony_separation:
   device: "cuda:0"
   chunk_batch: 16
   output_sample_rate: 44100
+  use_compile: true             # torch.compile transformer (~1.3x speedup)
 
 # =============================================================================
 # Stage 2: Reverb Separation (混响分离)
@@ -93,6 +94,7 @@ reverb_separation:
   device: "cuda:0"
   chunk_batch: 8
   output_sample_rate: 44100
+  use_compile: true             # torch.compile transformer (~1.3x speedup)
 
 # =============================================================================
 # Stage 3: Timbre Conversion (音色替换)
@@ -114,7 +116,7 @@ timbre_conversion:
   infer_step: 100              # 推理轮 (rounds): ODE sampling steps
   t_start: 0.4                 # 浮动 (float): ODE start time, 0=pure diffusion, 1=pure DDSP
   method: "euler"              # ODE solver: "euler" (faster) or "rk4" (more accurate)
-  pitch_extractor: "rmvpe"     # F0 extraction: "rmvpe", "fcpe", "parselmouth", "dio", "harvest", "crepe"
+  pitch_extractor: "fcpe"      # F0 extraction: "fcpe" (GPU, fast), "rmvpe", "parselmouth", "dio", "harvest", "crepe"
 
   # Pitch settings
   key: 0                       # Key shift in semitones (0 = original pitch)

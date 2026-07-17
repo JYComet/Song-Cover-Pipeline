@@ -23,7 +23,7 @@ import time
 import logging
 import hashlib
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -246,6 +246,7 @@ class DDSPConverter:
         self,
         input_path: str | Path,
         output_path: str | Path,
+        progress_callback: Optional[Callable] = None,
     ) -> Path:
         """
         Convert the timbre of vocals in an audio file.
@@ -256,6 +257,9 @@ class DDSPConverter:
             Path to input audio file (should be clean, dry vocals).
         output_path : Path
             Path to write the timbre-converted output.
+        progress_callback : callable or None
+            Optional callback for per-segment progress.
+            Signature: callback(segment_current: int, segment_total: int)
 
         Returns
         -------
@@ -287,7 +291,7 @@ class DDSPConverter:
         os.chdir(str(self.ddsp_project_dir))
 
         try:
-            self._run_inference(abs_input, abs_output)
+            self._run_inference(abs_input, abs_output, progress_callback)
         finally:
             os.chdir(original_cwd)
 
@@ -372,7 +376,8 @@ class DDSPConverter:
     # Internal: inference pipeline (mirrors main_reflow.py logic)
     # ------------------------------------------------------------------
 
-    def _run_inference(self, input_path: str, output_path: str) -> None:
+    def _run_inference(self, input_path: str, output_path: str,
+                        progress_callback: Optional[Callable] = None) -> None:
         """
         Execute the full DDSP-SVC inference pipeline.
 
@@ -531,6 +536,7 @@ class DDSPConverter:
                 formant_shift_tensor, vocal_register_factor,
                 units_encoder, sample_rate, hop_size,
                 block_size, infer_step, method, t_start,
+                progress_callback=progress_callback,
             )
         else:
             result = self._infer_sequential(
@@ -538,6 +544,7 @@ class DDSPConverter:
                 formant_shift_tensor, vocal_register_factor,
                 units_encoder, sample_rate, hop_size,
                 block_size, infer_step, method, t_start,
+                progress_callback=progress_callback,
             )
 
         # ---- Write output ----
@@ -553,6 +560,7 @@ class DDSPConverter:
         formant_shift_tensor, vocal_register_factor,
         units_encoder, sample_rate, hop_size,
         block_size, infer_step, method, t_start,
+        progress_callback: Optional[Callable] = None,
     ) -> np.ndarray:
         """Process segments one at a time (original behavior, kept for reference)."""
         import torch
@@ -564,9 +572,10 @@ class DDSPConverter:
 
         result = np.zeros(0)
         current_length = 0
+        total_segments = len(segments)
 
         with torch.no_grad():
-            for segment in tqdm(segments, desc="DDSP inference", unit="seg"):
+            for seg_idx, segment in enumerate(tqdm(segments, desc="DDSP inference", unit="seg")):
                 start_frame = segment[0]
                 seg_input = (
                     torch.from_numpy(segment[1]).float().unsqueeze(0).to(self.device)
@@ -626,6 +635,13 @@ class DDSPConverter:
                     current_length + silent_length + len(seg_output)
                 )
 
+                # Report progress
+                if progress_callback:
+                    try:
+                        progress_callback(seg_idx + 1, total_segments)
+                    except Exception:
+                        pass
+
         return result
 
     # ------------------------------------------------------------------
@@ -637,6 +653,7 @@ class DDSPConverter:
         formant_shift_tensor, vocal_register_factor,
         units_encoder, sample_rate, hop_size,
         block_size, infer_step, method, t_start,
+        progress_callback: Optional[Callable] = None,
     ) -> np.ndarray:
         """
         Process multiple audio segments in a single GPU forward pass.
@@ -751,6 +768,13 @@ class DDSPConverter:
 
                 i += batch_size
                 pbar.update(batch_size)
+
+                # Report progress
+                if progress_callback:
+                    try:
+                        progress_callback(min(i, total_segments), total_segments)
+                    except Exception:
+                        pass
 
             pbar.close()
 
