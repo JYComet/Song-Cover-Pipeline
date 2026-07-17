@@ -118,6 +118,13 @@ timbre_conversion:
   threshold: -60               # Response threshold in dB
   spk_id: 1                    # Speaker ID (for multi-speaker models)
 
+  # =========================================================================
+  # Performance tuning (optional, disabled by default for safety)
+  # =========================================================================
+  use_compile: false            # torch.compile LYNXNet2 + Unit2Control (PyTorch >= 2.0)
+  use_amp: false                # FP16 mixed-precision for reflow ODE steps
+  segment_batch_size: 1         # Batch N segments per GPU forward (1=sequential, 4-8 for speed)
+
 # =============================================================================
 # Stage 4: Final Mixing (混音叠加)
 # Mixes the timbre-converted vocals with the original instrumental and reverb.

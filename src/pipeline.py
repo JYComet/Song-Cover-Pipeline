@@ -393,6 +393,10 @@ class SongCoverPipeline:
             f0_max=stage_cfg.get("f0_max", 800),
             threshold=stage_cfg.get("threshold", -60),
             spk_id=stage_cfg.get("spk_id", 1),
+            # Performance tuning
+            use_compile=stage_cfg.get("use_compile", False),
+            use_amp=stage_cfg.get("use_amp", False),
+            segment_batch_size=stage_cfg.get("segment_batch_size", 1),
         )
 
         try:

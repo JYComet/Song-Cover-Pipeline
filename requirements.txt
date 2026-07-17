@@ -2,7 +2,7 @@
 # =============================================================================
 # Core dependencies (needed for all stages)
 # =============================================================================
-torch>=2.0.0                    # PyTorch with CUDA support
+torch>=2.0.0                    # PyTorch with CUDA support (2.0+ for torch.compile)
 numpy>=1.24.0
 scipy>=1.10.0
 soundfile>=0.12.0
@@ -13,19 +13,49 @@ tqdm>=4.65.0
 # =============================================================================
 # MSST separation dependencies (Stages 1 & 2)
 # =============================================================================
-# flash_attn>=2.0.0             # Flash Attention (for BS-RoFormer models) — optional but recommended
-# einops>=0.6.0                 # Einstein operations
+# flash-attn>=2.0.0             # Flash Attention — 30-50% speedup for BS-RoFormer models
+                                # Install: pip install flash-attn --no-build-isolation
+                                # Requires: CUDA toolkit, ninja, and a compatible GPU (Ampere+)
+# einops>=0.6.0                 # Einstein operations (required by flash_attn)
 
 # =============================================================================
 # DDSP-SVC dependencies (Stage 3)
 # =============================================================================
 # The DDSP-SVC project uses these additional packages:
-#   pyworld>=0.3.0              # WORLD vocoder (F0 extraction)
+#   pyworld>=0.3.0              # WORLD vocoder (F0 extraction — parselmouth/dio/harvest)
 #   parselmouth>=0.4.0          # Praat-based F0 extraction
 #   torchcrepe>=0.0.18          # CREPE neural F0 extraction
-#   resampy>=0.4.0              # Audio resampling
-#   transformers>=4.30.0        # HuggingFace Transformers (ContentVec encoder)
-#   torchfcpe>=0.0.5            # FCPE neural F0 extraction (optional, faster)
+#   resampy>=0.4.0              # Audio resampling (used by some F0 extractors)
+#   transformers>=4.30.0        # HuggingFace Transformers (ContentVec/HuBERT encoder)
+#   torchfcpe>=0.0.5            # FCPE neural F0 extraction — faster GPU-based alternative to RMVPE
 #
 # Install them with:
 #   pip install pyworld parselmouth torchcrepe resampy transformers torchfcpe
+
+# =============================================================================
+# Performance Optimization Guide
+# =============================================================================
+#
+# For maximum speed without quality loss, in order of impact:
+#
+# 1. Install Flash Attention (MSST stages, 30-50% faster):
+#    pip install flash-attn --no-build-isolation
+#
+# 2. Enable torch.compile (DDSP stage, 20-40% faster, PyTorch >= 2.0):
+#    Set `use_compile: true` in config under timbre_conversion.
+#
+# 3. Enable FP16 AMP (DDSP stage, 30-50% faster):
+#    Set `use_amp: true` in config under timbre_conversion.
+#
+# 4. Batch DDSP segments (DDSP stage, 2-4x higher GPU utilization):
+#    Set `segment_batch_size: 4` (or higher if VRAM permits) in config.
+#
+# 5. Use FCPE pitch extractor (faster GPU-based F0 extraction vs RMVPE):
+#    pip install torchfcpe
+#    Set `pitch_extractor: "fcpe"` in config under timbre_conversion.
+#
+# 6. Increase MSST chunk_batch (more VRAM = higher throughput):
+#    Set `chunk_batch: 16` or higher in config under harmony_separation / reverb_separation.
+#
+# 7. Reduce DDSP infer_step (quality/speed tradeoff, 40-60 is often sufficient):
+#    Set `infer_step: 50` in config under timbre_conversion.

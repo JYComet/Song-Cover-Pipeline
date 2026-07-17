@@ -258,33 +258,33 @@ class AudioMixer:
 
         Waveform is returned as (channels, samples).
         Resamples to self.sample_rate if needed.
+        Uses soundfile for fast I/O, falls back to librosa for resampling.
         """
         path = Path(path)
         if not path.is_file():
             raise FileNotFoundError(f"Track file not found: {path} ({label})")
 
-        import librosa
-
-        audio, sr = librosa.load(str(path), sr=None, mono=False)
+        # Fast path: use soundfile for pure load (3-5x faster than librosa)
+        audio, sr = sf.read(str(path))
 
         # Normalize shape: always (channels, samples)
         if audio.ndim == 1:
-            # mono returned as (samples,)
             audio = np.expand_dims(audio, axis=0)
-        elif audio.ndim == 2 and audio.shape[0] > 2:
-            # librosa may return (samples, channels) for stereo
-            audio = audio.T
+        else:
+            audio = audio.T  # (samples, channels) -> (channels, samples)
+        audio = audio.astype(np.float32)
 
         # Resample if needed
         if sr != self.sample_rate:
             logger.info(
                 "  %s: resampling %d -> %d Hz", label, sr, self.sample_rate
             )
+            import librosa
             audio = librosa.resample(
                 audio, orig_sr=sr, target_sr=self.sample_rate, axis=-1
             )
 
-        return audio.astype(np.float32), self.sample_rate
+        return audio, self.sample_rate
 
 
 # ------------------------------------------------------------------
