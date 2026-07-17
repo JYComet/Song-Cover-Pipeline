@@ -1,0 +1,20 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Model checkpoints (too large for git — managed separately)
+models/
+vendor/ddsp/pretrain/
+
+# Pipeline output
+output/
+
+# Pipeline checkpoint (generated at runtime)
+.pipeline_checkpoint.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

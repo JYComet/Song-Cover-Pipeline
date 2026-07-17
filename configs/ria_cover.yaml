@@ -1,0 +1,136 @@
+# =============================================================================
+# Song Cover Pipeline Configuration
+# Task: ria timbre cover of "我想要占据你"
+#
+# All paths are relative to PROJECT_ROOT or absolute.
+# The vendor/ directory contains copied external dependencies (MSST + DDSP).
+# The models/ directory contains model checkpoints.
+# =============================================================================
+
+task:
+  name: "ria音色翻唱-我想要占据你"
+  input_song: "input/我想要占据你.wav"
+  output_dir: "output/我想要占据你"
+
+# =============================================================================
+# Stage 0: Extract Audio (提取音频)
+# If the input is a video file (.mp4, .mkv, etc.), extract the audio track
+# as WAV before feeding it into the pipeline.  Audio inputs pass through.
+# =============================================================================
+extract_audio:
+  enabled: true
+  sample_rate: 44100           # Target sample rate for extracted audio
+
+# =============================================================================
+# Stage 1: Harmony Separation (和声分离)
+# Separates lead vocals from the instrumental/BGM/harmony backing track.
+# Uses BS-RoFormer karaoke model (frazer & becruily).
+# =============================================================================
+harmony_separation:
+  enabled: true
+
+  # MSST code directory (copied into vendor/)
+  msst_code_dir: "vendor/msst"
+
+  # Model architecture type
+  model_type: "bs_roformer"
+
+  # YAML configuration file for the karaoke model
+  config_path: "vendor/msst/configs/config_karaoke_frazer_becruily.yaml"
+
+  # Model checkpoint file (.ckpt)
+  checkpoint_path: "models/MSST/bs_roformer_karaoke_frazer_becruily.ckpt"
+
+  # Target stem to extract as the primary output (lead vocals)
+  target_stem: "Vocals"
+
+  # Additional stems to save (background instrumental/harmony)
+  other_stems:
+    - "Instrumental"
+
+  # Inference settings
+  device: "cuda:0"
+  chunk_batch: 16
+  output_sample_rate: 44100
+
+# =============================================================================
+# Stage 2: Reverb Separation (混响分离)
+# Separates dry vocal signal from its reverb tail.
+# Uses BS-RoFormer dereverb model (anvuew).
+# =============================================================================
+reverb_separation:
+  enabled: true
+
+  # MSST code directory (same as Stage 1)
+  msst_code_dir: "vendor/msst"
+
+  # Model architecture type
+  model_type: "bs_roformer"
+
+  # YAML configuration for the dereverb model (customized for this checkpoint)
+  config_path: "vendor/msst/configs/dereverb_bs_roformer_anvuew.yaml"
+
+  # Model checkpoint file (.ckpt)
+  checkpoint_path: "models/MSST/dereverb_bs_roformer_anvuew_sdr_22.5050.ckpt"
+
+  # Target stem (dry vocals without reverb)
+  target_stem: "noreverb"
+
+  # Additional stems to save (reverb tail, derived as residual if needed)
+  other_stems:
+    - "reverb"
+
+  # Inference settings
+  device: "cuda:0"
+  chunk_batch: 8
+  output_sample_rate: 44100
+
+# =============================================================================
+# Stage 3: Timbre Conversion (音色替换)
+# Converts the vocal timbre to the target speaker using DDSP-SVC.
+# Uses RectifiedFlow model with PC-NSF-HiFiGAN vocoder.
+# =============================================================================
+timbre_conversion:
+  enabled: true
+
+  # DDSP-SVC project root (copied into vendor/ddsp/)
+  # Must contain: reflow/, ddsp/, encoder/, nsf_hifigan/, slicer.py, pretrain/
+  ddsp_project_dir: "vendor/ddsp"
+
+  # Model checkpoint (copied to models/DDSP/)
+  model_ckpt: "models/DDSP/paipai.pt"
+
+  # Inference parameters
+  device: "cuda:0"
+  infer_step: 100              # 推理轮 (rounds): ODE sampling steps
+  t_start: 0.4                 # 浮动 (float): ODE start time, 0=pure diffusion, 1=pure DDSP
+  method: "euler"              # ODE solver: "euler" (faster) or "rk4" (more accurate)
+  pitch_extractor: "rmvpe"     # F0 extraction: "rmvpe", "fcpe", "parselmouth", "dio", "harvest", "crepe"
+
+  # Pitch settings
+  key: 0                       # Key shift in semitones (0 = original pitch)
+  vocal_register_shift: 0      # Vocal register shift (for PC vocoder)
+  formant_shift: 0             # Formant shift (for pitch-augmented models)
+
+  # Voice activity settings
+  f0_min: 65                   # Minimum F0 in Hz
+  f0_max: 800                  # Maximum F0 in Hz
+  threshold: -60               # Response threshold in dB
+  spk_id: 1                    # Speaker ID (for multi-speaker models)
+
+# =============================================================================
+# Stage 4: Final Mixing (混音叠加)
+# Mixes the timbre-converted vocals with the original instrumental and reverb.
+# =============================================================================
+mixing:
+  enabled: true
+
+  # Gain adjustments (dB)
+  vocal_gain: 0.0
+  instrumental_gain: 0.0
+  reverb_gain: -3.0            # Slightly reduce reverb for clarity
+
+  # Output settings
+  normalize_output: true
+  output_format: "wav"
+  output_sample_rate: 44100

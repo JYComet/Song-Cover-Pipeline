@@ -1,0 +1,64 @@
+# =============================================================================
+# Song Cover Pipeline — paipai音色翻唱《锁R＆B》
+# =============================================================================
+
+task:
+  name: "paipai音色翻唱-锁R&B"
+  input_song: "input/《锁R＆B》.mp4"
+  output_dir: "output/锁R&B"
+
+extract_audio:
+  enabled: true
+  sample_rate: 44100
+
+harmony_separation:
+  enabled: true
+  msst_code_dir: "vendor/msst"
+  model_type: "bs_roformer"
+  config_path: "vendor/msst/configs/config_karaoke_frazer_becruily.yaml"
+  checkpoint_path: "models/MSST/bs_roformer_karaoke_frazer_becruily.ckpt"
+  target_stem: "Vocals"
+  other_stems:
+    - "Instrumental"
+  device: "cuda:0"
+  chunk_batch: 16
+  output_sample_rate: 44100
+
+reverb_separation:
+  enabled: true
+  msst_code_dir: "vendor/msst"
+  model_type: "bs_roformer"
+  config_path: "vendor/msst/configs/dereverb_bs_roformer_anvuew.yaml"
+  checkpoint_path: "models/MSST/dereverb_bs_roformer_anvuew_sdr_22.5050.ckpt"
+  target_stem: "noreverb"
+  other_stems:
+    - "reverb"
+  device: "cuda:0"
+  chunk_batch: 8
+  output_sample_rate: 44100
+
+timbre_conversion:
+  enabled: true
+  ddsp_project_dir: "vendor/ddsp"
+  model_ckpt: "models/DDSP/paipai.pt"
+  device: "cuda:0"
+  infer_step: 100
+  t_start: 0.4
+  method: "euler"
+  pitch_extractor: "rmvpe"
+  key: 0
+  vocal_register_shift: 0
+  formant_shift: 0
+  f0_min: 65
+  f0_max: 800
+  threshold: -60
+  spk_id: 1
+
+mixing:
+  enabled: true
+  vocal_gain: 0.0
+  instrumental_gain: 0.0
+  reverb_gain: -3.0
+  normalize_output: true
+  output_format: "wav"
+  output_sample_rate: 44100

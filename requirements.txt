@@ -1,0 +1,31 @@
+# Song Cover Pipeline — Python Dependencies
+# =============================================================================
+# Core dependencies (needed for all stages)
+# =============================================================================
+torch>=2.0.0                    # PyTorch with CUDA support
+numpy>=1.24.0
+scipy>=1.10.0
+soundfile>=0.12.0
+librosa>=0.10.0
+pyyaml>=6.0
+tqdm>=4.65.0
+
+# =============================================================================
+# MSST separation dependencies (Stages 1 & 2)
+# =============================================================================
+# flash_attn>=2.0.0             # Flash Attention (for BS-RoFormer models) — optional but recommended
+# einops>=0.6.0                 # Einstein operations
+
+# =============================================================================
+# DDSP-SVC dependencies (Stage 3)
+# =============================================================================
+# The DDSP-SVC project uses these additional packages:
+#   pyworld>=0.3.0              # WORLD vocoder (F0 extraction)
+#   parselmouth>=0.4.0          # Praat-based F0 extraction
+#   torchcrepe>=0.0.18          # CREPE neural F0 extraction
+#   resampy>=0.4.0              # Audio resampling
+#   transformers>=4.30.0        # HuggingFace Transformers (ContentVec encoder)
+#   torchfcpe>=0.0.5            # FCPE neural F0 extraction (optional, faster)
+#
+# Install them with:
+#   pip install pyworld parselmouth torchcrepe resampy transformers torchfcpe
