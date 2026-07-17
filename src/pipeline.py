@@ -94,13 +94,30 @@ class SongCoverPipeline:
             if self._stage_enabled("extract_audio"):
                 results["stages"]["extract_audio"] = self._run_extract_audio()
 
-            # Stage 1: Harmony separation
-            if self._stage_enabled("harmony_separation"):
-                results["stages"]["harmony_separation"] = self._run_harmony_separation()
+            # Check if linked separation is enabled (runs karaoke+dereverb in one shot)
+            linked_cfg = self.config.get("linked_separation", {})
+            if linked_cfg.get("enabled", False):
+                # Stages 1+2: Linked karaoke → dereverb (GPU memory pass-through)
+                linked_result = self._run_linked_separation()
+                results["stages"]["linked_separation"] = linked_result
+                results["stages"]["harmony_separation"] = {
+                    "status": "completed (via linked)",
+                    "files": {k: str(v) for k, v in linked_result.get("files", {}).items()
+                              if k in ("Vocals", "Instrumental")},
+                }
+                results["stages"]["reverb_separation"] = {
+                    "status": "completed (via linked)",
+                    "files": {k: str(v) for k, v in linked_result.get("files", {}).items()
+                              if k in ("noreverb", "reverb")},
+                }
+            else:
+                # Stage 1: Harmony separation (standalone)
+                if self._stage_enabled("harmony_separation"):
+                    results["stages"]["harmony_separation"] = self._run_harmony_separation()
 
-            # Stage 2: Reverb separation
-            if self._stage_enabled("reverb_separation"):
-                results["stages"]["reverb_separation"] = self._run_reverb_separation()
+                # Stage 2: Reverb separation (standalone)
+                if self._stage_enabled("reverb_separation"):
+                    results["stages"]["reverb_separation"] = self._run_reverb_separation()
 
             # Stage 3: Timbre conversion
             if self._stage_enabled("timbre_conversion"):
@@ -351,6 +368,120 @@ class SongCoverPipeline:
 
         finally:
             separator.unload_model()
+
+    def _run_linked_separation(self) -> dict:
+        """
+        Stages 1+2 combined: Karaoke → Dereverb with GPU memory pass-through.
+
+        Both BS-RoFormer models are loaded simultaneously. The vocals STFT from
+        the karaoke model is reused directly by the dereverb model, avoiding:
+          - Disk I/O for intermediate vocals.wav (save ~0.8s)
+          - STFT recomputation in dereverb model
+          - librosa-based residual computation (replaced by STFT-domain)
+
+        Residual stems (Instrumental, reverb) are computed in the complex STFT
+        domain, which is both faster and more precise than time-domain subtraction.
+        """
+        linked_cfg = self.config.get("linked_separation", {})
+        karaoke_cfg = self.config["harmony_separation"]
+        dereverb_cfg = self.config["reverb_separation"]
+
+        stage_name = "linked_separation"
+        if self._is_stage_done("01_harmony_separation") and self._is_stage_done("02_reverb_separation"):
+            logger.info("Linked separation: both stages already completed, skipping.")
+            return {"status": "skipped"}
+
+        logger.info("=" * 50)
+        logger.info("STAGES 1+2: Linked Separation (和声分离 + 混响分离)")
+        logger.info("=" * 50)
+
+        from src.msst_separator import MSSTSeparator, LinkedMSSTSeparator
+
+        linked = None
+        try:
+            # Create and load both separators
+            karaoke = MSSTSeparator(
+                msst_code_dir=karaoke_cfg["msst_code_dir"],
+                model_type=karaoke_cfg.get("model_type", "bs_roformer"),
+                config_path=karaoke_cfg["config_path"],
+                checkpoint_path=karaoke_cfg["checkpoint_path"],
+                device=karaoke_cfg.get("device", "cuda:0"),
+                chunk_batch=karaoke_cfg.get("chunk_batch", 16),
+            )
+            dereverb = MSSTSeparator(
+                msst_code_dir=dereverb_cfg["msst_code_dir"],
+                model_type=dereverb_cfg.get("model_type", "bs_roformer"),
+                config_path=dereverb_cfg["config_path"],
+                checkpoint_path=dereverb_cfg["checkpoint_path"],
+                device=dereverb_cfg.get("device", "cuda:0"),
+                chunk_batch=dereverb_cfg.get("chunk_batch", 8),
+            )
+
+            # Load both models
+            logger.info("Loading both models simultaneously...")
+            karaoke.load_model()
+            dereverb.load_model()
+
+            # Create linked separator
+            linked = LinkedMSSTSeparator(karaoke, dereverb)
+
+            # Load input audio
+            import soundfile as sf
+            import numpy as np
+            audio, sr = sf.read(str(self.input_song))
+            if audio.ndim == 1:
+                audio = np.expand_dims(audio, axis=0)
+            else:
+                audio = audio.T  # (samples, ch) → (ch, samples)
+            audio = audio.astype(np.float32)
+
+            # Run linked separation
+            stage_dir = self.output_dir / "01_harmony_separation"
+            saved = linked.separate(
+                audio=audio,
+                sample_rate=sr,
+                output_dir=stage_dir,
+                base_name=self.input_song.stem,
+                output_sample_rate=karaoke_cfg.get("output_sample_rate", 44100),
+            )
+
+            # Move reverb-separation outputs to the correct stage directory
+            # so downstream stages (_find_stage_output) can locate them.
+            import shutil
+            reverb_dir = self.output_dir / "02_reverb_separation"
+            reverb_dir.mkdir(parents=True, exist_ok=True)
+            import shutil
+            for stem_key in ("noreverb", "reverb"):
+                src = saved.get(stem_key)
+                if src and Path(src).is_file():
+                    dst = reverb_dir / Path(src).name
+                    if src != str(dst):
+                        shutil.move(str(src), str(dst))
+                        saved[stem_key] = str(dst)
+                        logger.info("Moved %s → %s", Path(src).name, reverb_dir)
+
+            result = {
+                "status": "completed",
+                "output_dir": str(stage_dir),
+                "files": {k: str(v) for k, v in saved.items()},
+            }
+            self._mark_stage_done("01_harmony_separation")
+            self._mark_stage_done("02_reverb_separation")
+            return result
+
+        finally:
+            if linked is not None:
+                linked.unload_models()
+            else:
+                # Clean up individually if linked wasn't created
+                try:
+                    karaoke.unload_model()
+                except Exception:
+                    pass
+                try:
+                    dereverb.unload_model()
+                except Exception:
+                    pass
 
     def _run_timbre_conversion(self) -> dict:
         """Stage 3: Convert vocal timbre using DDSP-SVC."""

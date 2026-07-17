@@ -344,12 +344,12 @@ class DDSPConverter:
 
         try:
             # The reflow model structure:
-            #   self._model.reflow_model.model  ->  LYNXNet2 instance
+            #   self._model.reflow_model.velocity_fn  ->  LYNXNet2 instance
             reflow_model = self._model.reflow_model
-            inner_net = reflow_model.model  # LYNXNet2
+            inner_net = reflow_model.velocity_fn  # LYNXNet2
             compiled_net = torch.compile(inner_net, mode="reduce-overhead")
-            reflow_model.model = compiled_net
-            logger.info("torch.compile applied to LYNXNet2 (reflow model), mode=reduce-overhead")
+            reflow_model.velocity_fn = compiled_net
+            logger.info("torch.compile applied to LYNXNet2 (reflow velocity_fn), mode=reduce-overhead")
 
             # Also compile the DDSP control network (Unit2Control) for
             # the single-pass DDSP forward.

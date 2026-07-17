@@ -84,7 +84,7 @@ class Unit2Control(nn.Module):
             else:
                 x = x + self.spk_embed(spk_id - 1)
         if self.aug_shift_embed is not None and aug_shift is not None:
-            x = x + self.aug_shift_embed(aug_shift / 5)
+            x = x + self.aug_shift_embed(aug_shift / 5).unsqueeze(1)
         x = self.decoder(x)
         x = self.norm(x)
         e = self.dense_out(x)

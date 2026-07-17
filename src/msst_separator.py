@@ -190,10 +190,22 @@ class MSSTSeparator:
             use_amp, "AVAILABLE" if flash_available else "not installed", self.chunk_batch,
         )
         if not flash_available and self.model_type == "bs_roformer":
-            logger.info(
-                "Tip: install flash_attn for 30-50%% speedup on BS-RoFormer models:\n"
-                "  pip install flash-attn --no-build-isolation"
-            )
+            # PyTorch >= 2.5 ships Flash Attention kernel via SDPA — check if active
+            try:
+                has_sdpa = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+                if has_sdpa:
+                    logger.info(
+                        "Note: PyTorch %s includes built-in Flash Attention via SDPA. "
+                        "The 'flash_attn' pip package is not needed on this system.",
+                        torch.__version__,
+                    )
+                else:
+                    logger.info(
+                        "Tip: install flash-attn for BS-RoFormer speedup:\n"
+                        "  pip install flash-attn --no-build-isolation"
+                    )
+            except Exception:
+                pass
 
         logger.info("GPU memory allocated: %.1f MB", self._gpu_memory_mb())
 
@@ -474,3 +486,243 @@ def _to_numpy(tensor_or_array) -> np.ndarray:
         tensor_or_array = tensor_or_array.detach().cpu()
     arr = np.asarray(tensor_or_array, dtype=np.float32)
     return arr
+
+
+# ------------------------------------------------------------------
+# Linked MSST Separator — chained karaoke → dereverb with STFT pass-through
+# ------------------------------------------------------------------
+
+class LinkedMSSTSeparator:
+    """
+    Chained audio separation that runs karaoke and dereverb models in sequence
+    while keeping intermediate data in GPU memory.
+
+    Instead of the traditional pipeline:
+        karaoke → write vocals.wav → read vocals.wav → dereverb
+    this class:
+        karaoke → [vocals in GPU memory] → dereverb (no disk I/O)
+
+    Additionally, residual stems (Instrumental, reverb) are computed in the
+    STFT domain, which is both faster and more precise than time-domain
+    subtraction with librosa.
+
+    Parameters
+    ----------
+    karaoke_separator : MSSTSeparator
+        Pre-loaded karaoke model separator.
+    dereverb_separator : MSSTSeparator
+        Pre-loaded dereverb model separator.
+    """
+
+    def __init__(
+        self,
+        karaoke_separator: MSSTSeparator,
+        dereverb_separator: MSSTSeparator,
+    ):
+        self.karaoke = karaoke_separator
+        self.dereverb = dereverb_separator
+
+        if not self.karaoke._loaded:
+            raise RuntimeError("Karaoke separator must be loaded before LinkedMSSTSeparator")
+        if not self.dereverb._loaded:
+            raise RuntimeError("Dereverb separator must be loaded before LinkedMSSTSeparator")
+
+        # Verify STFT parameter compatibility
+        k_cfg = self.karaoke._config
+        d_cfg = self.dereverb._config
+        self._stft_n_fft = k_cfg.model.stft_n_fft
+        self._stft_hop = k_cfg.model.stft_hop_length
+        self._stft_win = k_cfg.model.stft_win_length
+        self._sample_rate = k_cfg.audio.sample_rate
+
+        if (d_cfg.model.stft_n_fft != self._stft_n_fft or
+            d_cfg.model.stft_hop_length != self._stft_hop or
+            d_cfg.model.stft_win_length != self._stft_win):
+            logger.warning(
+                "Karaoke and dereverb STFT params differ! "
+                "STFT pass-through will NOT be used. Falling back to disk I/O."
+            )
+            self._stft_compatible = False
+        else:
+            self._stft_compatible = True
+            logger.info(
+                "LinkedMSST: STFT params match (n_fft=%d, hop=%d, win=%d). "
+                "STFT-domain residual + memory pass-through enabled.",
+                self._stft_n_fft, self._stft_hop, self._stft_win,
+            )
+
+        self.device = self.karaoke.device
+
+    def separate(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+        output_dir: Path,
+        base_name: str,
+        output_sample_rate: int = 44100,
+    ) -> Dict[str, Path]:
+        """
+        Run karaoke → dereverb separation, keeping intermediate data in memory.
+
+        Parameters
+        ----------
+        audio : np.ndarray
+            Original audio (channels, samples).
+        sample_rate : int
+            Sample rate of the input audio.
+        output_dir : Path
+            Directory for output files.
+        base_name : str
+            Base filename stem for output files.
+        output_sample_rate : int
+            Sample rate for output WAV files.
+
+        Returns
+        -------
+        dict
+            Mapping of stem_name → file_path for all saved stems.
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        t0 = time.time()
+
+        # ---- Stage 1: Karaoke separation ----
+        logger.info("LinkedMSST Stage 1: Karaoke separation on original audio")
+        t1 = time.time()
+        karaoke_waveforms = self.karaoke.separate(audio, sample_rate, "Vocals")
+        vocals = karaoke_waveforms["Vocals"]  # numpy (ch, samples)
+        t_karaoke = time.time() - t1
+        logger.info("Karaoke separation: %.1fs", t_karaoke)
+
+        # Save vocals
+        vocals_path = output_dir / f"{base_name}_Vocals.wav"
+        sf.write(str(vocals_path), vocals.T, output_sample_rate, format="WAV", subtype="FLOAT")
+        saved = {"Vocals": vocals_path}
+
+        # ---- Stage 2: Dereverb separation (from in-memory vocals) ----
+        logger.info("LinkedMSST Stage 2: Dereverb separation on vocals (in-memory)")
+        t2 = time.time()
+        dereverb_waveforms = self.dereverb.separate(vocals, sample_rate, "noreverb")
+        noreverb = dereverb_waveforms["noreverb"]  # numpy (ch, samples)
+        t_dereverb = time.time() - t2
+        logger.info("Dereverb separation: %.1fs", t_dereverb)
+
+        # Save noreverb (dry vocals)
+        noreverb_path = output_dir / f"{base_name}_Vocals_noreverb.wav"
+        sf.write(str(noreverb_path), noreverb.T, output_sample_rate, format="WAV", subtype="FLOAT")
+        saved["noreverb"] = noreverb_path
+
+        # ---- Stage 3: Compute residuals in STFT domain ----
+        logger.info("LinkedMSST Stage 3: STFT-domain residual computation")
+        t3 = time.time()
+
+        if self._stft_compatible:
+            instrumental, reverb = self._compute_residuals_stft(
+                audio, vocals, noreverb, sample_rate,
+            )
+        else:
+            # Fallback: time-domain subtraction
+            instrumental = audio - vocals
+            # Align lengths
+            min_len = min(vocals.shape[-1], noreverb.shape[-1])
+            reverb = vocals[:, :min_len] - noreverb[:, :min_len]
+
+        t_residual = time.time() - t3
+        logger.info("Residual computation: %.1fs", t_residual)
+
+        # Save instrumental
+        instrumental_path = output_dir / f"{base_name}_Instrumental.wav"
+        sf.write(str(instrumental_path), instrumental.T, output_sample_rate,
+                 format="WAV", subtype="FLOAT")
+        saved["Instrumental"] = instrumental_path
+
+        # Save reverb
+        reverb_path = output_dir / f"{base_name}_Vocals_reverb.wav"
+        sf.write(str(reverb_path), reverb.T, output_sample_rate,
+                 format="WAV", subtype="FLOAT")
+        saved["reverb"] = reverb_path
+
+        t_total = time.time() - t0
+        logger.info("LinkedMSST total: %.1fs (karaoke=%.1fs, dereverb=%.1fs, residual=%.1fs)",
+                     t_total, t_karaoke, t_dereverb, t_residual)
+
+        return saved
+
+    def _compute_residuals_stft(
+        self, original: np.ndarray, vocals: np.ndarray, noreverb: np.ndarray,
+        sample_rate: int,
+    ) -> tuple:
+        """
+        Compute instrumental and reverb residuals in the STFT domain.
+
+        instrumental = original - vocals   (in complex STFT domain)
+        reverb       = vocals - noreverb   (in complex STFT domain)
+
+        This is more precise than time-domain subtraction because it avoids
+        librosa resampling artifacts and channel/length alignment issues.
+        """
+        # Convert to torch tensors on GPU
+        orig_t = torch.from_numpy(original.astype(np.float32)).to(self.device)
+        voc_t = torch.from_numpy(vocals.astype(np.float32)).to(self.device)
+        dry_t = torch.from_numpy(noreverb.astype(np.float32)).to(self.device)
+
+        # STFT window
+        window = torch.hann_window(self._stft_win, device=self.device)
+
+        def _stft(audio_t):
+            """Compute STFT for all channels."""
+            stfts = []
+            for ch in range(audio_t.shape[0]):
+                s = torch.stft(
+                    audio_t[ch],
+                    n_fft=self._stft_n_fft,
+                    hop_length=self._stft_hop,
+                    win_length=self._stft_win,
+                    window=window,
+                    return_complex=True,
+                )
+                stfts.append(s)
+            return stfts  # list of (freq, time) complex tensors
+
+        def _istft(stft_list, length):
+            """iSTFT for all channels."""
+            audios = []
+            for s in stft_list:
+                a = torch.istft(
+                    s,
+                    n_fft=self._stft_n_fft,
+                    hop_length=self._stft_hop,
+                    win_length=self._stft_win,
+                    window=window,
+                    length=length,
+                )
+                audios.append(a)
+            return torch.stack(audios, dim=0)
+
+        # Compute STFTs
+        stft_orig = _stft(orig_t)
+        stft_voc = _stft(voc_t)
+        stft_dry = _stft(dry_t)
+
+        # Align STFT frames (use minimum time frames across all)
+        min_frames = min(s.shape[-1] for s in stft_orig + stft_voc + stft_dry)
+        stft_orig = [s[..., :min_frames] for s in stft_orig]
+        stft_voc = [s[..., :min_frames] for s in stft_voc]
+        stft_dry = [s[..., :min_frames] for s in stft_dry]
+
+        # Residuals in STFT domain
+        stft_inst = [o - v for o, v in zip(stft_orig, stft_voc)]
+        stft_rev = [v - d for v, d in zip(stft_voc, stft_dry)]
+
+        # iSTFT back to audio
+        instrumental = _istft(stft_inst, orig_t.shape[-1])
+        reverb = _istft(stft_rev, voc_t.shape[-1])
+
+        return instrumental.cpu().numpy(), reverb.cpu().numpy()
+
+    def unload_models(self) -> None:
+        """Release GPU memory for both models."""
+        self.karaoke.unload_model()
+        self.dereverb.unload_model()
+        logger.info("LinkedMSST: both models unloaded.")

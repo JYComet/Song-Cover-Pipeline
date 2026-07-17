@@ -11,6 +11,16 @@ extract_audio:
   enabled: true
   sample_rate: 44100
 
+# =============================================================================
+# Optimization: Linked Separation
+# When enabled, karaoke and dereverb models run back-to-back with GPU memory
+# pass-through (no intermediate disk write/read). Residual stems (Instrumental,
+# reverb) are computed in STFT domain for higher precision and speed.
+# Saves ~2-3s and improves reverb separation quality.
+# =============================================================================
+linked_separation:
+  enabled: true
+
 harmony_separation:
   enabled: true
   msst_code_dir: "vendor/msst"
@@ -21,7 +31,7 @@ harmony_separation:
   other_stems:
     - "Instrumental"
   device: "cuda:0"
-  chunk_batch: 16
+  chunk_batch: 32
   output_sample_rate: 44100
 
 reverb_separation:
@@ -34,7 +44,7 @@ reverb_separation:
   other_stems:
     - "reverb"
   device: "cuda:0"
-  chunk_batch: 8
+  chunk_batch: 16
   output_sample_rate: 44100
 
 timbre_conversion:
@@ -55,11 +65,11 @@ timbre_conversion:
   spk_id: 1
 
   # =========================================================================
-  # Performance tuning (optional, disabled by default for safety)
+  # Performance tuning
   # =========================================================================
-  use_compile: false            # torch.compile LYNXNet2 + Unit2Control (PyTorch >= 2.0)
-  use_amp: false                # FP16 mixed-precision for reflow ODE steps
-  segment_batch_size: 1         # Batch N segments per GPU forward (1=sequential, 4-8 for speed)
+  use_compile: false            # DISABLED: crashes with PyTorch 2.5+CUDA 12.1 (illegal instruction)
+  use_amp: false                # DISABLED: FP16 harms complex STFT ops in DDSP model
+  segment_batch_size: 1         # Sequential (batching has frame-alignment edge cases)
 
 mixing:
   enabled: true

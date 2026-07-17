@@ -22,6 +22,15 @@ extract_audio:
   sample_rate: 44100           # Target sample rate for extracted audio
 
 # =============================================================================
+# Optimization: Linked Separation
+# When enabled, karaoke and dereverb models run back-to-back with GPU memory
+# pass-through (no intermediate disk write/read). Residual stems (Instrumental,
+# reverb) are computed in STFT domain for higher precision and speed.
+# =============================================================================
+linked_separation:
+  enabled: false                # Set to true to enable the linked fast path
+
+# =============================================================================
 # Stage 1: Harmony Separation (和声分离)
 # Separates lead vocals from the instrumental/BGM/harmony backing track.
 # Uses BS-RoFormer karaoke model (frazer & becruily).
