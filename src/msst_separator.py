@@ -87,6 +87,7 @@ class MSSTSeparator:
         checkpoint_path: str | Path,
         device: str = "cuda:0",
         chunk_batch: int = 8,
+        use_compile: bool = False,
     ):
         self.msst_code_dir = Path(msst_code_dir)
         self.model_type = model_type
@@ -94,6 +95,7 @@ class MSSTSeparator:
         self.checkpoint_path = Path(checkpoint_path)
         self.device = device
         self.chunk_batch = chunk_batch
+        self.use_compile = use_compile
 
         self._model = None
         self._config = None
@@ -171,6 +173,10 @@ class MSSTSeparator:
             logger.info(
                 "Model inference.batch_size: %s -> %s", old_b, self.chunk_batch
             )
+
+        # torch.compile transformer layers (opt-in, ~1.3-1.4x speedup on attention)
+        if self.use_compile:
+            self._apply_torch_compile()
 
         # Log model info
         sr = getattr(config.audio, "sample_rate", "unknown")
@@ -361,6 +367,46 @@ class MSSTSeparator:
             logger.info("Saved: %s (%.1fs)", out_path.name, duration)
 
         return saved
+
+    def _apply_torch_compile(self) -> None:
+        """Apply torch.compile to the transformer layers of BS-RoFormer.
+
+        Only the attention + feedforward blocks are compiled (not STFT/iSTFT),
+        avoiding the 'TorchInductor does not support complex operators' warning.
+        Expected speedup: ~1.3-1.4x on the attention-heavy portion (~69% of time).
+        """
+        if self.model_type != "bs_roformer":
+            logger.warning(
+                "torch.compile is only tested with bs_roformer, skipping."
+            )
+            return
+
+        import torch as _torch
+        pkg_ver = getattr(_torch, '__version__', '1.0.0')
+        if pkg_ver < '2.0.0':
+            logger.warning(
+                "torch.compile requires PyTorch >= 2.0 (current: %s), skipping.",
+                pkg_ver,
+            )
+            return
+
+        if not self._model:
+            return
+
+        try:
+            compiled_count = 0
+            for i, block in enumerate(self._model.layers):
+                for j in range(len(block)):
+                    self._model.layers[i][j] = _torch.compile(
+                        block[j], mode="default"
+                    )
+                    compiled_count += 1
+            logger.info(
+                "torch.compile applied to %d transformer modules (mode=default)",
+                compiled_count,
+            )
+        except Exception as e:
+            logger.warning("torch.compile failed, falling back to eager: %s", e)
 
     def unload_model(self) -> None:
         """Release GPU memory held by the model."""

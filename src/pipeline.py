@@ -242,6 +242,7 @@ class SongCoverPipeline:
             checkpoint_path=stage_cfg["checkpoint_path"],
             device=stage_cfg.get("device", "cuda:0"),
             chunk_batch=stage_cfg.get("chunk_batch", 16),
+            use_compile=stage_cfg.get("use_compile", False),
         )
 
         try:
@@ -322,6 +323,7 @@ class SongCoverPipeline:
             checkpoint_path=stage_cfg["checkpoint_path"],
             device=stage_cfg.get("device", "cuda:0"),
             chunk_batch=stage_cfg.get("chunk_batch", 8),
+            use_compile=stage_cfg.get("use_compile", False),
         )
 
         try:
@@ -422,6 +424,7 @@ class SongCoverPipeline:
             checkpoint_path=karaoke_cfg["checkpoint_path"],
             device=karaoke_cfg.get("device", "cuda:0"),
             chunk_batch=karaoke_cfg.get("chunk_batch", 16),
+            use_compile=karaoke_cfg.get("use_compile", False),
         )
         try:
             karaoke.load_model()
@@ -446,6 +449,7 @@ class SongCoverPipeline:
             checkpoint_path=dereverb_cfg["checkpoint_path"],
             device=dereverb_cfg.get("device", "cuda:0"),
             chunk_batch=dereverb_cfg.get("chunk_batch", 8),
+            use_compile=dereverb_cfg.get("use_compile", False),
         )
         try:
             dereverb.load_model()

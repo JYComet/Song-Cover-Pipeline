@@ -33,6 +33,7 @@ harmony_separation:
   device: "cuda:0"
   chunk_batch: 32
   output_sample_rate: 44100
+  use_compile: true             # torch.compile transformer layers (~1.3x speedup on attention)
 
 reverb_separation:
   enabled: true
@@ -46,6 +47,7 @@ reverb_separation:
   device: "cuda:0"
   chunk_batch: 16
   output_sample_rate: 44100
+  use_compile: true             # torch.compile transformer layers (~1.3x speedup on attention)
 
 timbre_conversion:
   enabled: true
