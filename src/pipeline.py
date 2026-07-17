@@ -371,22 +371,22 @@ class SongCoverPipeline:
 
     def _run_linked_separation(self) -> dict:
         """
-        Stages 1+2 combined: Karaoke → Dereverb with GPU memory pass-through.
+        Stages 1+2 combined: Karaoke → Dereverb with in-memory data passing.
 
-        Both BS-RoFormer models are loaded simultaneously. The vocals STFT from
-        the karaoke model is reused directly by the dereverb model, avoiding:
-          - Disk I/O for intermediate vocals.wav (save ~0.8s)
-          - STFT recomputation in dereverb model
+        Instead of loading both models simultaneously (which causes GPU memory
+        bandwidth contention), we use a STAGED approach:
+          1. Load karaoke → run → keep vocals in RAM → UNLOAD karaoke
+          2. Load dereverb → run on in-memory vocals → UNLOAD dereverb
+          3. Compute residuals in STFT domain (fast + precise)
+
+        This avoids:
+          - Disk I/O for intermediate vocals.wav
+          - GPU memory bandwidth contention (only 1 model on GPU at a time)
           - librosa-based residual computation (replaced by STFT-domain)
-
-        Residual stems (Instrumental, reverb) are computed in the complex STFT
-        domain, which is both faster and more precise than time-domain subtraction.
         """
-        linked_cfg = self.config.get("linked_separation", {})
         karaoke_cfg = self.config["harmony_separation"]
         dereverb_cfg = self.config["reverb_separation"]
 
-        stage_name = "linked_separation"
         if self._is_stage_done("01_harmony_separation") and self._is_stage_done("02_reverb_separation"):
             logger.info("Linked separation: both stages already completed, skipping.")
             return {"status": "skipped"}
@@ -395,93 +395,101 @@ class SongCoverPipeline:
         logger.info("STAGES 1+2: Linked Separation (和声分离 + 混响分离)")
         logger.info("=" * 50)
 
-        from src.msst_separator import MSSTSeparator, LinkedMSSTSeparator
+        from src.msst_separator import MSSTSeparator
 
-        linked = None
+        # Load input audio
+        import soundfile as sf
+        import numpy as np
+        audio, sr = sf.read(str(self.input_song))
+        if audio.ndim == 1:
+            audio = np.expand_dims(audio, axis=0)
+        else:
+            audio = audio.T  # (samples, ch) → (ch, samples)
+        audio = audio.astype(np.float32)
+        sample_rate_out = karaoke_cfg.get("output_sample_rate", 44100)
+        stage_dir_1 = self.output_dir / "01_harmony_separation"
+        stage_dir_1.mkdir(parents=True, exist_ok=True)
+        base_name = self.input_song.stem
+
+        # ==================================================================
+        # Phase 1: Karaoke separation → keep vocals in memory
+        # ==================================================================
+        logger.info("--- Phase 1: Karaoke separation ---")
+        karaoke = MSSTSeparator(
+            msst_code_dir=karaoke_cfg["msst_code_dir"],
+            model_type=karaoke_cfg.get("model_type", "bs_roformer"),
+            config_path=karaoke_cfg["config_path"],
+            checkpoint_path=karaoke_cfg["checkpoint_path"],
+            device=karaoke_cfg.get("device", "cuda:0"),
+            chunk_batch=karaoke_cfg.get("chunk_batch", 16),
+        )
         try:
-            # Create and load both separators
-            karaoke = MSSTSeparator(
-                msst_code_dir=karaoke_cfg["msst_code_dir"],
-                model_type=karaoke_cfg.get("model_type", "bs_roformer"),
-                config_path=karaoke_cfg["config_path"],
-                checkpoint_path=karaoke_cfg["checkpoint_path"],
-                device=karaoke_cfg.get("device", "cuda:0"),
-                chunk_batch=karaoke_cfg.get("chunk_batch", 16),
-            )
-            dereverb = MSSTSeparator(
-                msst_code_dir=dereverb_cfg["msst_code_dir"],
-                model_type=dereverb_cfg.get("model_type", "bs_roformer"),
-                config_path=dereverb_cfg["config_path"],
-                checkpoint_path=dereverb_cfg["checkpoint_path"],
-                device=dereverb_cfg.get("device", "cuda:0"),
-                chunk_batch=dereverb_cfg.get("chunk_batch", 8),
-            )
-
-            # Load both models
-            logger.info("Loading both models simultaneously...")
             karaoke.load_model()
-            dereverb.load_model()
-
-            # Create linked separator
-            linked = LinkedMSSTSeparator(karaoke, dereverb)
-
-            # Load input audio
-            import soundfile as sf
-            import numpy as np
-            audio, sr = sf.read(str(self.input_song))
-            if audio.ndim == 1:
-                audio = np.expand_dims(audio, axis=0)
-            else:
-                audio = audio.T  # (samples, ch) → (ch, samples)
-            audio = audio.astype(np.float32)
-
-            # Run linked separation
-            stage_dir = self.output_dir / "01_harmony_separation"
-            saved = linked.separate(
-                audio=audio,
-                sample_rate=sr,
-                output_dir=stage_dir,
-                base_name=self.input_song.stem,
-                output_sample_rate=karaoke_cfg.get("output_sample_rate", 44100),
-            )
-
-            # Move reverb-separation outputs to the correct stage directory
-            # so downstream stages (_find_stage_output) can locate them.
-            import shutil
-            reverb_dir = self.output_dir / "02_reverb_separation"
-            reverb_dir.mkdir(parents=True, exist_ok=True)
-            import shutil
-            for stem_key in ("noreverb", "reverb"):
-                src = saved.get(stem_key)
-                if src and Path(src).is_file():
-                    dst = reverb_dir / Path(src).name
-                    if src != str(dst):
-                        shutil.move(str(src), str(dst))
-                        saved[stem_key] = str(dst)
-                        logger.info("Moved %s → %s", Path(src).name, reverb_dir)
-
-            result = {
-                "status": "completed",
-                "output_dir": str(stage_dir),
-                "files": {k: str(v) for k, v in saved.items()},
-            }
-            self._mark_stage_done("01_harmony_separation")
-            self._mark_stage_done("02_reverb_separation")
-            return result
-
+            karaoke_waveforms = karaoke.separate(audio, sr, "Vocals")
+            vocals = karaoke_waveforms["Vocals"]  # numpy (ch, samples) — kept in RAM
         finally:
-            if linked is not None:
-                linked.unload_models()
-            else:
-                # Clean up individually if linked wasn't created
-                try:
-                    karaoke.unload_model()
-                except Exception:
-                    pass
-                try:
-                    dereverb.unload_model()
-                except Exception:
-                    pass
+            karaoke.unload_model()
+
+        # Save vocals and compute instrumental from STFT
+        vocals_path = stage_dir_1 / f"{base_name}_Vocals.wav"
+        sf.write(str(vocals_path), vocals.T, sample_rate_out, format="WAV", subtype="FLOAT")
+        logger.info("Saved: %s", vocals_path.name)
+
+        # ==================================================================
+        # Phase 2: Dereverb separation on in-memory vocals
+        # ==================================================================
+        logger.info("--- Phase 2: Dereverb separation (in-memory) ---")
+        dereverb = MSSTSeparator(
+            msst_code_dir=dereverb_cfg["msst_code_dir"],
+            model_type=dereverb_cfg.get("model_type", "bs_roformer"),
+            config_path=dereverb_cfg["config_path"],
+            checkpoint_path=dereverb_cfg["checkpoint_path"],
+            device=dereverb_cfg.get("device", "cuda:0"),
+            chunk_batch=dereverb_cfg.get("chunk_batch", 8),
+        )
+        try:
+            dereverb.load_model()
+            dereverb_waveforms = dereverb.separate(vocals, sr, "noreverb")
+            noreverb = dereverb_waveforms["noreverb"]  # numpy (ch, samples)
+        finally:
+            dereverb.unload_model()
+
+        # Save noreverb
+        reverb_dir = self.output_dir / "02_reverb_separation"
+        reverb_dir.mkdir(parents=True, exist_ok=True)
+        noreverb_path = reverb_dir / f"{base_name}_Vocals_noreverb.wav"
+        sf.write(str(noreverb_path), noreverb.T, sample_rate_out, format="WAV", subtype="FLOAT")
+        logger.info("Saved: %s", noreverb_path.name)
+
+        # ==================================================================
+        # Phase 3: Residual computation in STFT domain (fast + precise)
+        # ==================================================================
+        logger.info("--- Phase 3: STFT-domain residual computation ---")
+        instrumental, reverb = _compute_residuals_stft(
+            audio, vocals, noreverb, sr,
+            n_fft=2048, hop_length=512, win_length=2048,
+        )
+
+        instrumental_path = stage_dir_1 / f"{base_name}_Instrumental.wav"
+        sf.write(str(instrumental_path), instrumental.T, sample_rate_out, format="WAV", subtype="FLOAT")
+        logger.info("Saved: %s", instrumental_path.name)
+
+        reverb_path = reverb_dir / f"{base_name}_Vocals_reverb.wav"
+        sf.write(str(reverb_path), reverb.T, sample_rate_out, format="WAV", subtype="FLOAT")
+        logger.info("Saved: %s", reverb_path.name)
+
+        result = {
+            "status": "completed",
+            "files": {
+                "Vocals": str(vocals_path),
+                "noreverb": str(noreverb_path),
+                "Instrumental": str(instrumental_path),
+                "reverb": str(reverb_path),
+            },
+        }
+        self._mark_stage_done("01_harmony_separation")
+        self._mark_stage_done("02_reverb_separation")
+        return result
 
     def _run_timbre_conversion(self) -> dict:
         """Stage 3: Convert vocal timbre using DDSP-SVC."""
@@ -811,3 +819,89 @@ def _find_residual_file(output_dir: Path, residual_name: str) -> Optional[Path]:
     """Find a residual stem file by name suffix."""
     candidates = sorted(output_dir.glob(f"*_{residual_name}.wav"))
     return candidates[0] if candidates else None
+
+
+def _compute_residuals_stft(
+    original: "np.ndarray",
+    vocals: "np.ndarray",
+    noreverb: "np.ndarray",
+    sample_rate: int,
+    n_fft: int = 2048,
+    hop_length: int = 512,
+    win_length: int = 2048,
+) -> tuple:
+    """
+    Compute instrumental and reverb residuals in the STFT domain.
+
+    instrumental = original - vocals   (complex STFT domain)
+    reverb       = vocals - noreverb   (complex STFT domain)
+
+    This is faster than time-domain subtraction because it avoids:
+      - librosa.load overhead for large WAV files
+      - Channel/length alignment logic
+      - Precision loss from resampling
+
+    Parameters
+    ----------
+    original : np.ndarray
+        Original audio (channels, samples).
+    vocals : np.ndarray
+        Vocals stem (channels, samples).
+    noreverb : np.ndarray
+        Dry vocals stem (channels, samples).
+    sample_rate : int
+        Sample rate (unused, accepted for interface compatibility).
+    n_fft, hop_length, win_length : int
+        STFT parameters.
+
+    Returns
+    -------
+    tuple of (instrumental, reverb) as numpy arrays.
+    """
+    import torch
+    import numpy as np
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    window = torch.hann_window(win_length, device=device)
+
+    def _stft(audio_np):
+        """Compute STFT for all channels → list of (freq, time) complex."""
+        audio_t = torch.from_numpy(audio_np.astype(np.float32)).to(device)
+        stfts = []
+        for ch in range(audio_t.shape[0]):
+            s = torch.stft(
+                audio_t[ch],
+                n_fft=n_fft, hop_length=hop_length, win_length=win_length,
+                window=window, return_complex=True,
+            )
+            stfts.append(s)
+        return stfts
+
+    def _istft(stft_list, length):
+        """iSTFT for all channels → (channels, samples) tensor."""
+        audios = []
+        for s in stft_list:
+            a = torch.istft(
+                s, n_fft=n_fft, hop_length=hop_length, win_length=win_length,
+                window=window, length=length,
+            )
+            audios.append(a)
+        return torch.stack(audios, dim=0)
+
+    stft_orig = _stft(original)
+    stft_voc = _stft(vocals)
+    stft_dry = _stft(noreverb)
+
+    # Align to minimum time frames
+    min_frames = min(s.shape[-1] for s in stft_orig + stft_voc + stft_dry)
+    stft_orig = [s[..., :min_frames] for s in stft_orig]
+    stft_voc = [s[..., :min_frames] for s in stft_voc]
+    stft_dry = [s[..., :min_frames] for s in stft_dry]
+
+    # Residuals in STFT domain (complex subtraction)
+    stft_inst = [o - v for o, v in zip(stft_orig, stft_voc)]
+    stft_rev = [v - d for v, d in zip(stft_voc, stft_dry)]
+
+    instrumental = _istft(stft_inst, original.shape[-1]).cpu().numpy()
+    reverb = _istft(stft_rev, vocals.shape[-1]).cpu().numpy()
+    return instrumental, reverb
