@@ -173,7 +173,7 @@ def process_batch():
                 torch.cuda.get_device_properties(0).total_memory / 1024**3)
 
     # ── Import MSST ──
-    from src.msst_separator import MSSTSeparator, LinkedMSSTSeparator
+    from src.msst_separator import MSSTSeparator
 
     # ── Load models (once for all files) ──
     logger.info("=" * 60)
@@ -202,12 +202,12 @@ def process_batch():
     try:
         karaoke.load_model()
         dereverb.load_model()
-
-        # Create linked separator for STFT-domain chained processing
-        linked = LinkedMSSTSeparator(karaoke, dereverb)
         output_sr = KARAOKE_CONFIG["output_sample_rate"]
 
-        # ── Process each file ──
+        # ── Process each file sequentially ──
+        # Approach: karaoke → keep vocals in RAM → dereverb → STFT residuals
+        # This avoids the LinkedMSSTSeparator's STFT pass-through, which has
+        # flash attention kernel compatibility issues with torch.compile.
         total_start = time.time()
         success_count = 0
         fail_count = 0
@@ -221,62 +221,52 @@ def process_batch():
             try:
                 t0 = time.time()
 
-                # Load audio
+                # Load audio → (channels, samples) float32
                 audio, sr = load_audio(audio_path)
+                audio_dur = audio.shape[-1] / sr
+                logger.info("Duration: %.1fs, shape=%s, sr=%d", audio_dur, audio.shape, sr)
 
-                # Create temp output dir for linked separation
-                temp_dir = OUTPUT_BASE / ".temp" / song_name
-                temp_dir.mkdir(parents=True, exist_ok=True)
+                # ── Step 1: Karaoke separation (和声分离) ──
+                logger.info("  [1/3] Karaoke separation...")
+                karaoke_waveforms = karaoke.separate(audio, sr, "Vocals")
+                vocals = karaoke_waveforms["Vocals"]  # (ch, samples) — keep in RAM
 
-                # Run linked separation (karaoke → dereverb)
-                saved = linked.separate(
-                    audio=audio,
-                    sample_rate=sr,
-                    output_dir=temp_dir,
-                    base_name=song_name,
-                    output_sample_rate=output_sr,
-                )
+                # ── Step 2: Dereverb separation on vocals (混响分离) ──
+                logger.info("  [2/3] Dereverb separation...")
+                dereverb_waveforms = dereverb.separate(vocals, sr, "noreverb")
+                noreverb = dereverb_waveforms["noreverb"]  # (ch, samples) — dry vocals
 
-                # ── Classify and move files to category directories ──
-                # saved contains: Vocals, noreverb, Instrumental, reverb
+                # ── Step 3: Residuals (STFT domain, fallback to time domain) ──
+                logger.info("  [3/3] Computing residuals (STFT domain)...")
+                try:
+                    instrumental, reverb = _compute_residuals_stft(
+                        audio, vocals, noreverb, sr,
+                    )
+                except Exception as stft_err:
+                    logger.warning("  STFT residual failed, falling back to time domain: %s", stft_err)
+                    instrumental, reverb = _compute_residuals_time(
+                        audio, vocals, noreverb,
+                    )
 
-                # 1. 纯净人声 (dry vocals) → 人声/
-                if "noreverb" in saved:
-                    src = saved["noreverb"]
-                    dst = DIR_VOCALS / f"{song_name}_noreverb.wav"
-                    _copy_file(src, dst)
-                    logger.info("  ✅ 人声(干声): %s", dst.name)
+                # ── Save to category directories ──
+                save_wav(noreverb, DIR_VOCALS / f"{song_name}_noreverb.wav", output_sr)
+                logger.info("  ✅ 人声(干声): %s_noreverb.wav", song_name)
 
-                # 2. 和声+伴奏 (instrumental + harmony) → 和声/
-                if "Instrumental" in saved:
-                    src = saved["Instrumental"]
-                    dst = DIR_HARMONY / f"{song_name}_Instrumental.wav"
-                    _copy_file(src, dst)
-                    logger.info("  ✅ 和声+伴奏: %s", dst.name)
+                save_wav(instrumental, DIR_HARMONY / f"{song_name}_Instrumental.wav", output_sr)
+                logger.info("  ✅ 和声+伴奏: %s_Instrumental.wav", song_name)
 
-                # 3. 混响 (reverb tail) → 混响/
-                if "reverb" in saved:
-                    src = saved["reverb"]
-                    dst = DIR_REVERB / f"{song_name}_reverb.wav"
-                    _copy_file(src, dst)
-                    logger.info("  ✅ 混响: %s", dst.name)
-
-                # Also save Vocals (带混响的人声) to 人声/ for reference
-                if "Vocals" in saved and "Vocals" not in [k for k in ["noreverb"]]:
-                    # Vocals with reverb - saved alongside dry for comparison
-                    pass  # User primarily wants dry vocals
-
-                # Clean up temp directory
-                import shutil
-                shutil.rmtree(temp_dir, ignore_errors=True)
+                save_wav(reverb, DIR_REVERB / f"{song_name}_reverb.wav", output_sr)
+                logger.info("  ✅ 混响: %s_reverb.wav", song_name)
 
                 elapsed = time.time() - t0
-                logger.info("  ⏱️  Completed in %.1fs", elapsed)
+                logger.info("  ⏱️  Completed in %.1fs (%.1fx realtime)", elapsed, audio_dur / max(elapsed, 0.001))
                 success_count += 1
 
             except Exception as e:
                 logger.error("  ❌ Failed: %s", e, exc_info=True)
                 fail_count += 1
+                # Clear GPU cache after error
+                torch.cuda.empty_cache()
                 continue
 
         # ── Summary ──
@@ -296,6 +286,109 @@ def process_batch():
         # Clean up
         karaoke.unload_model()
         dereverb.unload_model()
+
+
+def save_wav(waveform: np.ndarray, path: Path, sample_rate: int):
+    """Save waveform to WAV file. waveform shape: (channels, samples)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(path), waveform.T, sample_rate, format="WAV", subtype="FLOAT")
+
+
+def _compute_residuals_stft(
+    original: np.ndarray,
+    vocals: np.ndarray,
+    noreverb: np.ndarray,
+    sample_rate: int,
+    n_fft: int = 2048,
+    hop_length: int = 512,
+    win_length: int = 2048,
+) -> tuple:
+    """
+    Compute instrumental and reverb residuals in the STFT domain.
+
+    instrumental = original - vocals   (complex STFT domain)
+    reverb       = vocals - noreverb   (complex STFT domain)
+
+    Returns (instrumental, reverb) as numpy arrays.
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    window = torch.hann_window(win_length, device=device)
+
+    def _stft(audio_np):
+        audio_t = torch.from_numpy(audio_np.astype(np.float32)).to(device)
+        stfts = []
+        for ch in range(audio_t.shape[0]):
+            s = torch.stft(
+                audio_t[ch],
+                n_fft=n_fft, hop_length=hop_length, win_length=win_length,
+                window=window, return_complex=True,
+            )
+            stfts.append(s)
+        return stfts
+
+    def _istft(stft_list, length):
+        audios = []
+        for s in stft_list:
+            a = torch.istft(
+                s, n_fft=n_fft, hop_length=hop_length, win_length=win_length,
+                window=window, length=length,
+            )
+            audios.append(a)
+        return torch.stack(audios, dim=0)
+
+    stft_orig = _stft(original)
+    stft_voc = _stft(vocals)
+    stft_dry = _stft(noreverb)
+
+    # Align to minimum time frames
+    min_frames = min(s.shape[-1] for s in stft_orig + stft_voc + stft_dry)
+    stft_orig = [s[..., :min_frames] for s in stft_orig]
+    stft_voc = [s[..., :min_frames] for s in stft_voc]
+    stft_dry = [s[..., :min_frames] for s in stft_dry]
+
+    # Residuals in STFT domain (complex subtraction)
+    stft_inst = [o - v for o, v in zip(stft_orig, stft_voc)]
+    stft_rev = [v - d for v, d in zip(stft_voc, stft_dry)]
+
+    instrumental = _istft(stft_inst, original.shape[-1]).cpu().numpy()
+    reverb = _istft(stft_rev, vocals.shape[-1]).cpu().numpy()
+    return instrumental.astype(np.float32), reverb.astype(np.float32)
+
+
+def _compute_residuals_time(
+    original: np.ndarray,
+    vocals: np.ndarray,
+    noreverb: np.ndarray,
+) -> tuple:
+    """
+    Compute instrumental and reverb residuals in the time domain.
+
+    Fallback when STFT-domain computation fails (e.g. iSTFT window overlap issues).
+    instrumental = original - vocals
+    reverb       = vocals - noreverb
+    """
+    # Align channel counts
+    def _match_channels(ref, other):
+        if ref.shape[0] != other.shape[0]:
+            if ref.shape[0] == 1:
+                return np.repeat(other, ref.shape[0], axis=0)
+            elif other.shape[0] == 1:
+                return np.repeat(ref, other.shape[0], axis=0)
+            else:
+                return other[:ref.shape[0], :]
+        return other
+
+    vocals_m = _match_channels(original, vocals)
+    noreverb_m = _match_channels(original, noreverb)
+
+    # Align lengths
+    min_len_inst = min(original.shape[-1], vocals_m.shape[-1])
+    min_len_rev = min(vocals_m.shape[-1], noreverb_m.shape[-1])
+
+    instrumental = original[:, :min_len_inst] - vocals_m[:, :min_len_inst]
+    reverb = vocals_m[:, :min_len_rev] - noreverb_m[:, :min_len_rev]
+
+    return instrumental.astype(np.float32), reverb.astype(np.float32)
 
 
 def _copy_file(src: Path, dst: Path):
