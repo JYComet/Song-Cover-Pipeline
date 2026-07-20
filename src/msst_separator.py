@@ -560,7 +560,11 @@ def _demix_linked_stft(
     import torch.nn.functional as F
 
     # ── Chunk parameters (use karaoke's chunk_size for audio windowing) ──
-    chunk_size = int(config_k.inference.chunk_size)
+    # chunk_size may be in inference or audio section (mirrors demux logic)
+    if 'chunk_size' in config_k.inference:
+        chunk_size = int(config_k.inference.chunk_size)
+    else:
+        chunk_size = int(config_k.audio.chunk_size)
     num_overlap = int(config_k.inference.num_overlap)
     step = chunk_size // num_overlap
     fade_size = chunk_size // 10
