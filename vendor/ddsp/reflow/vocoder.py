@@ -54,7 +54,7 @@ def load_model_vocoder(
     print(' [Loading] ' + model_path)
     ckpt = torch.load(model_path, map_location=torch.device(device))
     model.to(device)
-    model.load_state_dict(ckpt['model'])
+    model.load_state_dict(ckpt['model'], strict=False)
     model.eval()
     return model, vocoder, args
 
