@@ -326,7 +326,32 @@ class DotDict(dict):
     __setattr__ = dict.__setitem__    
     __delattr__ = dict.__delitem__
 
-    
+
+class TimbreControl(torch.nn.Module):
+    """
+    Frequency-bin lookup tables for timbre-aware transformations.
+
+    Introduced in newer DDSP-barbara-6.3 checkpoints.  The two buffers are
+    deterministic (not trained), so even when loaded from defaults instead
+    of a checkpoint they produce identical values.
+
+    Kept as a proper submodule so that new-style checkpoints match exactly
+    while old-style checkpoints (without this module) still work via
+    strict=False in load_state_dict.
+    """
+    def __init__(self, sampling_rate: int, win_length: int):
+        super().__init__()
+        n_bins = win_length // 2 + 1
+        self.register_buffer(
+            "freq_bins",
+            torch.arange(n_bins, dtype=torch.float32) * sampling_rate / win_length,
+        )
+        self.register_buffer(
+            "_bin_idx",
+            torch.arange(n_bins, dtype=torch.long),
+        )
+
+
 class CombSubSuperFast(torch.nn.Module):
     def __init__(self, 
             sampling_rate,
@@ -347,6 +372,8 @@ class CombSubSuperFast(torch.nn.Module):
         self.register_buffer("block_size", torch.tensor(block_size))
         self.register_buffer("win_length", torch.tensor(win_length))
         self.register_buffer("window", torch.hann_window(win_length))
+        # TimbreControl — frequency-bin lookup tables (new DDSP-barbara-6.3)
+        self.timbre_control = TimbreControl(sampling_rate, win_length)
         #Unit2Control
         split_map = {
             'harmonic_magnitude': win_length // 2 + 1, 
