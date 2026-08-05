@@ -1,0 +1,91 @@
+# =============================================================================
+# Song Cover Pipeline Configuration
+# Task: paipai timbre cover of "0227 AI REF LEAD VOX"
+# =============================================================================
+
+task:
+  name: "paipai音色翻唱-0227"
+  input_song: "input/0227 AI REF LEAD VOX.mp3"
+  output_dir: "output/0227_cover"
+
+# =============================================================================
+# Stage 0: Extract Audio (提取音频)
+# =============================================================================
+extract_audio:
+  enabled: true
+  sample_rate: 44100
+
+# =============================================================================
+# Optimization: Linked Separation
+# =============================================================================
+linked_separation:
+  enabled: true
+
+# =============================================================================
+# Stage 1: Harmony Separation (和声分离)
+# =============================================================================
+harmony_separation:
+  enabled: true
+  msst_code_dir: "vendor/msst"
+  model_type: "bs_roformer"
+  config_path: "vendor/msst/configs/config_karaoke_frazer_becruily.yaml"
+  checkpoint_path: "models/MSST/bs_roformer_karaoke_frazer_becruily.ckpt"
+  target_stem: "Vocals"
+  other_stems:
+    - "Instrumental"
+  device: "cuda:0"
+  chunk_batch: 16
+  output_sample_rate: 44100
+  use_compile: true
+
+# =============================================================================
+# Stage 2: Reverb Separation (混响分离)
+# =============================================================================
+reverb_separation:
+  enabled: true
+  msst_code_dir: "vendor/msst"
+  model_type: "bs_roformer"
+  config_path: "vendor/msst/configs/dereverb_bs_roformer_anvuew.yaml"
+  checkpoint_path: "models/MSST/dereverb_bs_roformer_anvuew_sdr_22.5050.ckpt"
+  target_stem: "noreverb"
+  other_stems:
+    - "reverb"
+  device: "cuda:0"
+  chunk_batch: 8
+  output_sample_rate: 44100
+  use_compile: true
+
+# =============================================================================
+# Stage 3: Timbre Conversion (音色替换) — paipai.pt
+# =============================================================================
+timbre_conversion:
+  enabled: true
+  ddsp_project_dir: "vendor/ddsp"
+  model_ckpt: "models/DDSP/paipai.pt"
+  device: "cuda:0"
+  infer_step: 100
+  t_start: 0.4
+  method: "euler"
+  pitch_extractor: "fcpe"
+  key: 0
+  vocal_register_shift: 0
+  formant_shift: 0
+  f0_min: 65
+  f0_max: 800
+  threshold: -60
+  spk_id: 1
+  use_compile: false
+  use_amp: false
+  segment_batch_size: 1
+
+# =============================================================================
+# Stage 4: Final Mixing (混音叠加)
+# =============================================================================
+mixing:
+  enabled: true
+  vocal_gain: 0.0
+  instrumental_gain: 0.0
+  reverb_gain: -3.0
+  normalize_output: true
+  output_format: "wav"
+  output_sample_rate: 44100

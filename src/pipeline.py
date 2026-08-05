@@ -106,21 +106,73 @@ class SongCoverPipeline:
             "start_time": time.time(),
         }
 
+        # ---- Determine which stages are enabled (supports step skipping) ----
+        has_extract = self._stage_enabled("extract_audio")
+        has_harmony = self._stage_enabled("harmony_separation")
+        has_reverb  = self._stage_enabled("reverb_separation")
+        has_timbre  = self._stage_enabled("timbre_conversion")
+        has_mix     = self._stage_enabled("mixing")
+
+        # ---- Dynamic progress ranges based on enabled stages ----
+        # Build a list of (stage_key, label, weight) for progress allocation
+        _stage_weights = []
+        if has_extract:
+            _stage_weights.append(("extract_audio", 5))
+        if has_harmony and has_reverb and self.config.get("linked_separation", {}).get("enabled", False):
+            _stage_weights.append(("linked_separation", 40))  # combined weight
+        else:
+            if has_harmony:
+                _stage_weights.append(("harmony_separation", 20))
+            if has_reverb:
+                _stage_weights.append(("reverb_separation", 20))
+        if has_timbre:
+            _stage_weights.append(("timbre_conversion", 45))
+        if has_mix:
+            _stage_weights.append(("mixing", 10))
+
+        # Compute dynamic progress start/end for each stage
+        _total_weight = sum(w for _, w in _stage_weights) if _stage_weights else 100
+        _stage_progress = {}
+        _cur = 0.0
+        for stage_key, weight in _stage_weights:
+            pct = (weight / _total_weight) * 100.0
+            _stage_progress[stage_key] = (_cur, _cur + pct)
+            _cur += pct
+
+        def _progress_dyn(stage, status, message=""):
+            """Like _progress but computes percent from stage position."""
+            if stage in _stage_progress:
+                start, end = _stage_progress[stage]
+                if status == "started":
+                    _progress(stage, status, start, message)
+                elif status == "completed":
+                    _progress(stage, status, end, message)
+                elif status == "progress":
+                    # For in-progress, use start (DDSP will update within range)
+                    _progress(stage, status, start, message)
+                else:
+                    _progress(stage, status, start, message)
+            else:
+                _progress(stage, status, 0.0, message)
+
         try:
             # Stage 0: Extract audio from video (if needed)
-            if self._stage_enabled("extract_audio"):
-                _progress("extract_audio", "started", 0.0, "Extracting audio from input...")
+            if has_extract:
+                _progress_dyn("extract_audio", "started", "Extracting audio from input...")
                 results["stages"]["extract_audio"] = self._run_extract_audio()
-                _progress("extract_audio", "completed", 5.0, "Audio extraction complete")
+                _progress_dyn("extract_audio", "completed")
 
             # Check if linked separation is enabled (runs karaoke+dereverb in one shot)
+            # Only valid when BOTH harmony AND reverb are enabled
             linked_cfg = self.config.get("linked_separation", {})
-            if linked_cfg.get("enabled", False):
+            _use_linked = linked_cfg.get("enabled", False) and has_harmony and has_reverb
+
+            if _use_linked:
                 # Stages 1+2: Linked karaoke → dereverb (GPU memory pass-through)
-                _progress("linked_separation", "started", 5.0,
-                          "加载和声分离模型 (~200MB), 首次运行需稍等...")
+                _progress_dyn("linked_separation", "started",
+                              "加载和声分离模型 (~200MB), 首次运行需稍等...")
                 linked_result = self._run_linked_separation(progress_callback=progress_callback)
-                _progress("linked_separation", "completed", 45.0, "和声+混响分离完成")
+                _progress_dyn("linked_separation", "completed")
                 results["stages"]["linked_separation"] = linked_result
                 results["stages"]["harmony_separation"] = {
                     "status": "completed (via linked)",
@@ -134,33 +186,33 @@ class SongCoverPipeline:
                 }
             else:
                 # Stage 1: Harmony separation (standalone)
-                if self._stage_enabled("harmony_separation"):
-                    _progress("harmony_separation", "started", 5.0,
-                              "加载和声分离模型 (~200MB), 首次运行需稍等...")
+                if has_harmony:
+                    _progress_dyn("harmony_separation", "started",
+                                  "加载和声分离模型 (~200MB), 首次运行需稍等...")
                     results["stages"]["harmony_separation"] = self._run_harmony_separation()
-                    _progress("harmony_separation", "completed", 25.0, "和声分离完成, 人声+伴奏已分离")
+                    _progress_dyn("harmony_separation", "completed")
 
                 # Stage 2: Reverb separation (standalone)
-                if self._stage_enabled("reverb_separation"):
-                    _progress("reverb_separation", "started", 25.0,
-                              "加载混响分离模型 (~200MB), 首次运行需稍等...")
+                if has_reverb:
+                    _progress_dyn("reverb_separation", "started",
+                                  "加载混响分离模型 (~200MB), 首次运行需稍等...")
                     results["stages"]["reverb_separation"] = self._run_reverb_separation()
-                    _progress("reverb_separation", "completed", 45.0, "混响分离完成, 干声+混响尾已分离")
+                    _progress_dyn("reverb_separation", "completed")
 
             # Stage 3: Timbre conversion
-            if self._stage_enabled("timbre_conversion"):
-                _progress("timbre_conversion", "started", 45.0,
-                          "加载DDSP音色模型 (~210MB), 首次运行需稍等...")
+            if has_timbre:
+                _progress_dyn("timbre_conversion", "started",
+                              "加载DDSP音色模型 (~210MB), 首次运行需稍等...")
                 results["stages"]["timbre_conversion"] = self._run_timbre_conversion(
                     progress_callback=progress_callback
                 )
-                _progress("timbre_conversion", "completed", 90.0, "音色替换完成!")
+                _progress_dyn("timbre_conversion", "completed")
 
             # Stage 4: Final mix
-            if self._stage_enabled("mixing"):
-                _progress("mixing", "started", 90.0, "Final mixing...")
+            if has_mix:
+                _progress_dyn("mixing", "started", "Final mixing...")
                 results["stages"]["mixing"] = self._run_mixing()
-                _progress("mixing", "completed", 100.0, "Pipeline complete!")
+                _progress_dyn("mixing", "completed")
 
         except Exception as exc:
             logger.error("Pipeline failed: %s", exc, exc_info=True)
@@ -548,7 +600,13 @@ class SongCoverPipeline:
         return result
 
     def _run_timbre_conversion(self, progress_callback: Optional[Callable] = None) -> dict:
-        """Stage 3: Convert vocal timbre using DDSP-SVC."""
+        """Stage 3: Convert vocal timbre using DDSP-SVC.
+
+        Input selection logic (respects which prior stages ran):
+          1. If reverb separation ran → use noreverb.wav (dry vocals)
+          2. Elif harmony separation ran → use Vocals.wav
+          3. Else → use the original input file directly
+        """
         stage_cfg = self.config["timbre_conversion"]
         stage_name = "03_timbre_conversion"
 
@@ -560,16 +618,38 @@ class SongCoverPipeline:
         logger.info("STAGE 3: Timbre Conversion (音色替换)")
         logger.info("=" * 50)
 
-        # Find the dry vocals file from Stage 2
-        dry_vocals_file = self._find_stage_output(
-            "02_reverb_separation", "noreverb", "dry"
-        )
-        if dry_vocals_file is None:
-            raise FileNotFoundError(
-                "Cannot find dry vocals (noreverb) output from Stage 2. "
-                "Reverb separation must be run first."
+        # ---- Smart input file selection with fallback ----
+        has_reverb  = self._stage_enabled("reverb_separation")
+        has_harmony = self._stage_enabled("harmony_separation")
+
+        dry_vocals_file = None
+        source_label = ""
+
+        if has_reverb:
+            # Best: dry vocals from reverb separation (noreverb)
+            dry_vocals_file = self._find_stage_output(
+                "02_reverb_separation", "noreverb", "dry"
             )
-        logger.info("Input dry vocals: %s", dry_vocals_file.name)
+            if dry_vocals_file:
+                source_label = "noreverb (stage 2)"
+        if dry_vocals_file is None and has_harmony:
+            # Fallback 1: vocals from harmony separation
+            dry_vocals_file = self._find_stage_output(
+                "01_harmony_separation", "Vocals", "vocals"
+            )
+            if dry_vocals_file:
+                source_label = "Vocals (stage 1)"
+        if dry_vocals_file is None:
+            # Fallback 2: use original input directly
+            dry_vocals_file = self.input_song
+            source_label = "original input"
+
+        if dry_vocals_file is None or not dry_vocals_file.is_file():
+            raise FileNotFoundError(
+                "Cannot find input for timbre conversion. "
+                "Need at least one of: reverb output, harmony output, or original input."
+            )
+        logger.info("Input vocals (%s): %s", source_label, dry_vocals_file.name)
 
         from src.ddsp_converter import DDSPConverter
 
@@ -619,19 +699,30 @@ class SongCoverPipeline:
             converter.unload_model()
 
     def _run_mixing(self) -> dict:
-        """Stage 4: Mix all tracks into final cover song."""
+        """Stage 4: Mix all available tracks into final cover song.
+
+        Only converted_vocals is required.  Instrumental and reverb tracks
+        are optional — if a prior stage was skipped they will be silently
+        omitted from the mix.
+        """
         stage_cfg = self.config["mixing"]
         stage_name = "04_final_mix"
 
-        # Mixing is fast, always run it
         logger.info("=" * 50)
         logger.info("STAGE 4: Final Mix (混音叠加)")
         logger.info("=" * 50)
 
-        # Find all required tracks
+        # Find converted vocals (REQUIRED)
         converted_vocals = self._find_stage_output(
             "03_timbre_conversion", "converted", "converted"
         )
+        if converted_vocals is None:
+            raise FileNotFoundError(
+                "Cannot find converted vocals from Stage 3. "
+                "Timbre conversion must be run first."
+            )
+
+        # Find instrumental and reverb (OPTIONAL — may be skipped by user)
         instrumental = self._find_stage_output(
             "01_harmony_separation", "Instrumental", "instrumental"
         )
@@ -639,22 +730,15 @@ class SongCoverPipeline:
             "02_reverb_separation", "reverb", "reverb"
         )
 
-        missing = []
-        if converted_vocals is None:
-            missing.append("converted vocals (Stage 3)")
-        if instrumental is None:
-            missing.append("instrumental (Stage 1)")
-        if reverb is None:
-            missing.append("reverb (Stage 2)")
-
-        if missing:
-            raise FileNotFoundError(
-                "Missing tracks for mixing: " + ", ".join(missing)
-            )
-
         logger.info("Converted vocals: %s", converted_vocals.name)
-        logger.info("Instrumental:     %s", instrumental.name)
-        logger.info("Reverb:           %s", reverb.name)
+        if instrumental:
+            logger.info("Instrumental:     %s", instrumental.name)
+        else:
+            logger.info("Instrumental:     (skipped — harmony separation not run)")
+        if reverb:
+            logger.info("Reverb:           %s", reverb.name)
+        else:
+            logger.info("Reverb:           (skipped — reverb separation not run)")
 
         from src.audio_mixer import AudioMixer
 

@@ -826,6 +826,7 @@ def _generate_task_config(
     output_dir: Path,
     model_ckpt: str,
     params: dict,
+    steps: dict = None,
 ) -> dict:
     """
     Merge user-provided parameter overrides with the default config.
@@ -833,6 +834,8 @@ def _generate_task_config(
     The default config provides all the stable settings (model paths,
     MSST configs, etc.).  User params only override the exposed knobs.
     """
+    if steps is None:
+        steps = {}
     config = _load_default_config()
 
     # Update task section
@@ -840,6 +843,23 @@ def _generate_task_config(
     config["task"]["input_song"] = str(input_path)
     config["task"]["output_dir"] = str(output_dir)
     config["_project_root"] = str(_PROJECT_ROOT)
+
+    # ---- Step selection: which pipeline stages to run ----
+    steps = params.get("steps", {})
+    # Default: all enabled
+    config.setdefault("harmony_separation", {})["enabled"] = steps.get("harmony", True)
+    config.setdefault("reverb_separation", {})["enabled"]  = steps.get("reverb", True)
+    config.setdefault("timbre_conversion", {})["enabled"]  = steps.get("timbre", True)
+    # extract_audio and mixing are always enabled
+    config.setdefault("extract_audio", {})["enabled"] = True
+    config.setdefault("mixing", {})["enabled"] = True
+    # linked_separation: only valid when BOTH harmony AND reverb are enabled
+    linked_enabled = (
+        config["harmony_separation"]["enabled"] and
+        config["reverb_separation"]["enabled"] and
+        config.get("linked_separation", {}).get("enabled", False)
+    )
+    config.setdefault("linked_separation", {})["enabled"] = linked_enabled
 
     # Timbre conversion overrides
     tc = config.setdefault("timbre_conversion", {})
@@ -1088,6 +1108,7 @@ async def create_task(request: Request):
     upload_id = body.get("upload_id", "")
     params = body.get("params", {})
     keep_intermediates = body.get("keep_intermediates", False)
+    steps = body.get("steps", {})  # {"harmony": true, "reverb": true, "timbre": true}
 
     if not upload_id:
         raise HTTPException(status_code=400, detail="upload_id is required")
@@ -1151,6 +1172,7 @@ async def create_task(request: Request):
         output_dir=output_dir,
         model_ckpt=model_ckpt,
         params=params,
+        steps=steps,
     )
 
     # Save a copy of the generated config for reference

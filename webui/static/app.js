@@ -13,6 +13,8 @@ const STATE = {
     status: 'idle',  // idle | uploading | ready | processing | done | error
     audioCtx: null,
     playing: false,
+    _activeSteps: null,  // { harmony: bool, reverb: bool, timbre: bool }
+    _pollTimer: null,
 };
 
 // =========================================================================
@@ -448,14 +450,22 @@ async function startProcessing() {
 
     try {
         const keepIntermediates = document.getElementById('param-keep_intermediates')?.checked || false;
+        // Collect step selections
+        const steps = {
+            harmony: document.getElementById('step-harmony')?.checked ?? true,
+            reverb: document.getElementById('step-reverb')?.checked ?? true,
+            timbre: document.getElementById('step-timbre')?.checked ?? true,
+        };
         const data = await apiPost('/api/tasks', {
             upload_id: STATE.uploadId,
             params: params,
             keep_intermediates: keepIntermediates,
+            steps: steps,
         });
 
         STATE.taskId = data.task_id;
         STATE._pollTimer = null;  // reset poll timer
+        STATE._activeSteps = steps;  // remember which steps are enabled
         showState('processing');
         DOM.btnStart.disabled = true;
         DOM.btnStart.textContent = '⏳ 处理中...';
@@ -466,7 +476,7 @@ async function startProcessing() {
         DOM.progressPercent.textContent = '0%';
         DOM.progressStage.textContent = '';
         DOM.progressMessage.textContent = '正在初始化...';
-        resetStageIndicators();
+        setupStageDots(steps);
 
         // Connect WebSocket for progress (with REST polling fallback)
         connectWebSocket(data.task_id);
@@ -609,22 +619,49 @@ function formatStageName(stage) {
 }
 
 function resetStageIndicators() {
-    $$('.stage-dot').forEach(dot => dot.className = 'stage-dot');
+    $$('.stage-dot').forEach(dot => {
+        dot.className = 'stage-dot';
+        dot.style.display = '';  // restore visibility
+    });
+}
+
+/**
+ * Show/hide stage dots based on which steps the user selected.
+ * Dots for disabled steps are hidden so the progress display only
+ * shows the steps that will actually execute.
+ */
+function setupStageDots(steps) {
+    // Always show extract_audio and mixing
+    const visibility = {
+        'extract_audio': true,
+        'harmony_separation': steps.harmony !== false,
+        'reverb_separation': steps.reverb !== false,
+        'timbre_conversion': steps.timbre !== false,
+        'mixing': true,
+    };
+
+    $$('.stage-dot').forEach(dot => {
+        const ds = dot.dataset.stage;
+        const visible = visibility[ds] !== false;
+        dot.style.display = visible ? '' : 'none';
+        dot.className = 'stage-dot';
+    });
 }
 
 function updateStageIndicators(currentStage, status) {
-    // linked_separation combines harmony + reverb
+    // Only consider visible stage dots
     const stages = ['extract_audio', 'harmony_separation', 'reverb_separation',
                     'timbre_conversion', 'mixing'];
     const linkedCompletes = new Set(['harmony_separation', 'reverb_separation']);
     let passed = true;
 
     $$('.stage-dot').forEach(dot => {
+        if (dot.style.display === 'none') return;  // skip hidden dots
+
         const ds = dot.dataset.stage;
-        if (ds === currentStage || (currentStage === 'linked_separation' && linkedCompletes.has(ds) && passed)) {
-            // linked_separation counts as both harmony + reverb
+        if (currentStage === 'linked_separation' && linkedCompletes.has(ds) && passed) {
             dot.className = 'stage-dot active';
-            if (currentStage === 'linked_separation') passed = false;
+            passed = false;
         } else if (ds === currentStage) {
             dot.className = 'stage-dot active';
             passed = false;

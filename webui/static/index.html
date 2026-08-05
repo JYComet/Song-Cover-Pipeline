@@ -63,6 +63,33 @@
                 <small class="form-hint">选择要替换的目标人声模型</small>
             </div>
 
+            <!-- Step Selector -->
+            <fieldset class="param-section step-selector" id="step-selector">
+                <legend>📋 执行步骤</legend>
+                <div class="step-list">
+                    <label class="step-item" id="step-harmony-label">
+                        <input type="checkbox" id="step-harmony" checked>
+                        <span class="step-num">1</span>
+                        <span class="step-label">和声分离</span>
+                        <small class="step-hint">人声/伴奏分离</small>
+                    </label>
+                    <span class="step-arrow">→</span>
+                    <label class="step-item" id="step-reverb-label">
+                        <input type="checkbox" id="step-reverb" checked>
+                        <span class="step-num">2</span>
+                        <span class="step-label">混响分离</span>
+                        <small class="step-hint">干声/混响分离</small>
+                    </label>
+                    <span class="step-arrow">→</span>
+                    <label class="step-item" id="step-timbre-label">
+                        <input type="checkbox" id="step-timbre" checked>
+                        <span class="step-num">3</span>
+                        <span class="step-label">音色替换</span>
+                        <small class="step-hint">人声→目标音色</small>
+                    </label>
+                </div>
+            </fieldset>
+
             <!-- Basic Parameters -->
             <fieldset class="param-section">
                 <legend>基本参数</legend>

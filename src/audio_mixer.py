@@ -93,22 +93,35 @@ class AudioMixer:
 
         logger.info("Mixing tracks for: %s", output_path.name)
 
-        # Load all tracks
+        # Load all tracks.  Vocal is required; instrumental and reverb
+        # are optional (may be None if the corresponding stage was skipped).
         tracks: List[Tuple[np.ndarray, float]] = []
+        track_names: List[str] = []
 
         vocal, vr = self._load_track(vocal_path, "vocals")
         tracks.append((vocal, self.vocal_gain_db))
+        track_names.append("vocals")
 
-        instrumental, ir = self._load_track(instrumental_path, "instrumental")
+        if instrumental_path is not None and Path(instrumental_path).is_file():
+            instrumental, ir = self._load_track(instrumental_path, "instrumental")
+        else:
+            logger.info("  instrumental: skipped (not available), using silence")
+            instrumental = np.zeros_like(vocal)
+            ir = vr
         tracks.append((instrumental, self.instrumental_gain_db))
+        track_names.append("instrumental")
 
-        reverb, rr = self._load_track(reverb_path, "reverb")
+        if reverb_path is not None and Path(reverb_path).is_file():
+            reverb, rr = self._load_track(reverb_path, "reverb")
+        else:
+            logger.info("  reverb: skipped (not available), using silence")
+            reverb = np.zeros_like(vocal)
+            rr = vr
         tracks.append((reverb, self.reverb_gain_db))
+        track_names.append("reverb")
 
         # Log track info
-        for name, (arr, gain) in zip(
-            ["vocals", "instrumental", "reverb"], tracks
-        ):
+        for name, (arr, gain) in zip(track_names, tracks):
             logger.info(
                 "  %s: shape=%s, peak=%.2fdB, gain=%.1fdB",
                 name, arr.shape, _peak_db(arr), gain,
@@ -116,9 +129,7 @@ class AudioMixer:
 
         # ---- Process each track ----
         processed = []
-        for name, (arr, gain_db) in zip(
-            ["vocals", "instrumental", "reverb"], tracks
-        ):
+        for name, (arr, gain_db) in zip(track_names, tracks):
             # Resample if needed
             # (tracks loaded at self.sample_rate by _load_track)
 
@@ -136,9 +147,7 @@ class AudioMixer:
         logger.info("Max track length: %.1fs", max_len / self.sample_rate)
 
         aligned = []
-        for name, arr in zip(
-            ["vocals", "instrumental", "reverb"], processed
-        ):
+        for name, arr in zip(track_names, processed):
             if arr.shape[-1] < max_len:
                 # Zero-pad shorter tracks
                 pad_width = max_len - arr.shape[-1]
