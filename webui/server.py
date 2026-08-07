@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
-# Path setup — project root is the parent of this webui/ directory
+# Path setup -- project root is the parent of this webui/ directory
 # ---------------------------------------------------------------------------
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -100,6 +100,7 @@ MODELS_DIR = _PROJECT_ROOT / "models" / "DDSP"
 # Upload / storage limits
 MAX_UPLOAD_SIZE_BYTES = 2 * 1024 * 1024 * 1024   # 2 GB max per file
 UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024               # 8 MB write chunks
+MAX_BATCH_FILES = 50                               # max files per batch job
 
 # ---- Tiered cleanup strategy ----
 # After a successful task, keep only these stage directories;
@@ -133,13 +134,46 @@ class TaskState:
     """In-memory state for one pipeline task."""
     id: str
     status: str = "pending"          # pending | running | completed | failed
-    progress: float = 0.0            # 0–100
+    progress: float = 0.0            # 0-100
     stage: str = ""                  # current stage key
     message: str = ""                # human-readable
     output_files: Dict[str, str] = field(default_factory=dict)
     error: Optional[str] = None
     input_filename: str = ""
     model_name: str = ""
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+
+
+@dataclass
+class BatchFileEntry:
+    """State for one file inside a batch job."""
+    file_id: str                        # == upload_id == task_id of the sub-task
+    input_filename: str
+    input_path: Path = field(default_factory=Path)
+    output_dir: Path = field(default_factory=Path)
+    config: Dict[str, Any] = field(default_factory=dict)
+    model_ckpt: str = ""
+    keep_intermediates: bool = False
+    status: str = "pending"             # pending | running | completed | failed
+    progress: float = 0.0
+    stage: str = ""
+    message: str = ""
+    error: Optional[str] = None
+    output_files: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class BatchState:
+    """In-memory state for a batch job."""
+    id: str
+    status: str = "pending"             # pending | running | completed | failed
+    progress: float = 0.0
+    current_index: int = 0
+    message: str = ""
+    error: Optional[str] = None
+    files: List[BatchFileEntry] = field(default_factory=list)
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
@@ -158,8 +192,8 @@ class TaskManager:
 
     Thread-safety:
       - Task state reads are lock-free (single-writer pattern).
-      - Lock ordering: _lock → _tasks dict mutation.
-      - `_running_task_id` tracks which task currently holds the GPU,
+      - Lock ordering: _lock -> _tasks dict mutation.
+      - ``_running_task_id`` tracks which task currently holds the GPU,
         and is ONLY modified while _lock is held.
     """
 
@@ -168,8 +202,11 @@ class TaskManager:
         self._tasks: Dict[str, TaskState] = {}
         self._ws_subscribers: Dict[str, List[WebSocket]] = {}
         self._running_task_id: Optional[str] = None   # None if idle (only valid under lock)
+        # Batch tracking
+        self._batches: Dict[str, BatchState] = {}
+        self._batch_subscribers: Dict[str, List[WebSocket]] = {}
 
-    # -- Public queries (lock-free reads — safe since dict writes are GIL-atomic) --
+    # -- Public queries (lock-free reads -- safe since dict writes are GIL-atomic) --
 
     def is_running(self) -> bool:
         """True if any task is currently executing (GPU is busy)."""
@@ -250,215 +287,255 @@ class TaskManager:
         except RuntimeError:
             pass  # no running event loop (e.g. during import)
 
-    # -- Pipeline execution (runs in a background thread) --
+    # -- Batch management --
 
-    def run_task(
+    def create_batch(self, files_meta: List[Dict[str, Any]]) -> BatchState:
+        """Create a BatchState and register sub-TaskStates for each file."""
+        batch_id = uuid.uuid4().hex[:12]
+        batch = BatchState(id=batch_id)
+        for meta in files_meta:
+            upload_id = meta["upload_id"]
+            input_path = meta["input_path"]
+            output_dir = meta["output_dir"]
+            config = meta["config"]
+            model_ckpt = meta.get("model_ckpt", "")
+            input_filename = meta.get("input_filename", input_path.name)
+            keep_intermediates = meta.get("keep_intermediates", False)
+
+            # Create sub-TaskState
+            task = TaskState(
+                id=upload_id,
+                input_filename=input_filename,
+                model_name=Path(model_ckpt).stem if model_ckpt else "",
+            )
+            self._tasks[upload_id] = task
+            self._ws_subscribers.setdefault(upload_id, [])
+
+            entry = BatchFileEntry(
+                file_id=upload_id,
+                input_filename=input_filename,
+                input_path=input_path,
+                output_dir=output_dir,
+                config=config,
+                model_ckpt=model_ckpt,
+                keep_intermediates=keep_intermediates,
+            )
+            batch.files.append(entry)
+
+        self._batches[batch_id] = batch
+        self._batch_subscribers.setdefault(batch_id, [])
+        return batch
+
+    def get_batch(self, batch_id: str) -> Optional[BatchState]:
+        return self._batches.get(batch_id)
+
+    def subscribe_batch(self, batch_id: str, ws: WebSocket) -> None:
+        if batch_id not in self._batch_subscribers:
+            self._batch_subscribers[batch_id] = []
+        self._batch_subscribers[batch_id].append(ws)
+
+    def unsubscribe_batch(self, batch_id: str, ws: WebSocket) -> None:
+        if batch_id in self._batch_subscribers:
+            subs = self._batch_subscribers[batch_id]
+            if ws in subs:
+                subs.remove(ws)
+
+    async def broadcast_batch(self, batch_id: str, data: dict) -> None:
+        subs = self._batch_subscribers.get(batch_id, [])
+        if not subs:
+            return
+        dead: List[WebSocket] = []
+        payload = json.dumps(data)
+        for ws in subs:
+            try:
+                await ws.send_text(payload)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.unsubscribe_batch(batch_id, ws)
+
+    def _batch_payload(self, batch: BatchState) -> Dict[str, Any]:
+        """Serialize a batch snapshot for WS/REST."""
+        files_data = []
+        for f in batch.files:
+            fd: Dict[str, Any] = {
+                "file_id": f.file_id,
+                "input_filename": f.input_filename,
+                "status": f.status,
+                "progress": f.progress,
+                "stage": f.stage,
+                "message": f.message,
+                "error": f.error,
+            }
+            if f.output_files:
+                fd["output_files"] = f.output_files
+            else:
+                fd["output_files"] = None
+            files_data.append(fd)
+
+        return {
+            "type": "batch_progress",
+            "batch_id": batch.id,
+            "status": batch.status,
+            "progress": batch.progress,
+            "current_index": batch.current_index,
+            "message": batch.message,
+            "error": batch.error,
+            "files": files_data,
+        }
+
+    def _broadcast_batch_state(self, batch: BatchState) -> None:
+        """Schedule a batch broadcast on the event loop (thread-safe)."""
+        payload = self._batch_payload(batch)
+        try:
+            loop = asyncio.get_running_loop()
+            loop.call_soon_threadsafe(
+                lambda d=payload: asyncio.ensure_future(self.broadcast_batch(batch.id, d))
+            )
+        except RuntimeError:
+            pass
+
+    def _batch_report(self, batch: BatchState, entry: BatchFileEntry,
+                      idx: int, kwargs: Dict[str, Any]) -> None:
+        """Bridge between _execute_single and batch state.
+
+        Updates the sub-TaskState, mirrors state to the BatchFileEntry,
+        recomputes batch progress, and broadcasts the batch snapshot.
+        """
+        # 1. Update sub-TaskState (keeps per-file endpoints in sync)
+        self.update_task(entry.file_id, **kwargs)
+
+        # 2. Mirror to BatchFileEntry
+        for k, v in kwargs.items():
+            if hasattr(entry, k):
+                setattr(entry, k, v)
+
+        # 3. Recompute batch progress
+        N = max(len(batch.files), 1)
+        pct = entry.progress
+        if entry.status in ("completed", "failed"):
+            batch.progress = round(((idx + 1) / N) * 100, 1)
+        else:
+            batch.progress = round(((idx + pct / 100.0) / N) * 100, 1)
+
+        batch.current_index = idx
+        batch.status = "running"
+        batch.message = kwargs.get("message", batch.message)
+
+        # 4. Broadcast batch snapshot
+        self._broadcast_batch_state(batch)
+
+    # -- Pipeline execution core (lock-free) --
+
+    def _execute_single(
         self,
         task_id: str,
         config: dict,
         input_path: Path,
         output_dir: Path,
         model_ckpt: str,
-        keep_intermediates: bool = False,
-    ) -> None:
+        keep_intermediates: bool,
+        report: Callable[..., None],
+    ) -> str:
         """
-        Run the pipeline synchronously in a background thread.
+        Run ONE pipeline to completion.  Lock-free -- the caller holds the GPU lock.
 
-        Acquires the task lock; if another task is already running the
-        current task is immediately marked 'failed' with HTTP 409 semantics.
+        ``report`` is invoked at every state change with the same keyword args
+        as update_task (status, progress, stage, message, error, output_files).
 
-        Parameters
-        ----------
-        keep_intermediates : bool
-            If False (default), intermediate stage directories are deleted
-            immediately after a successful run, keeping only the final mix.
+        Returns the final status: 'completed' or 'failed'.
         """
-        # ---- Acquire the single-task lock ----
-        if not self._lock.acquire(blocking=False):
-            self.update_task(
-                task_id,
-                status="failed",
-                error="Another task is already running. Please wait for it to complete.",
-                message="Server busy — another task is in progress.",
-            )
-            return
+        task = self._tasks.get(task_id)
 
-        # ---- We hold the lock: mark this task as running ----
-        self._running_task_id = task_id
-        try:
-            task = self._tasks.get(task_id)
-            if task is None:
-                return  # task was deleted before we started
+        # Mark started
+        if task is not None:
             task.started_at = datetime.now().isoformat()
-            self.update_task(
-                task_id,
-                status="running",
-                progress=0.0,
-                stage="starting",
-                message="Initializing pipeline...",
-            )
+        report(status="running", progress=0.0, stage="starting",
+               message="Initializing pipeline...")
 
-            from src.pipeline import SongCoverPipeline
+        from src.pipeline import SongCoverPipeline
 
-            # -- Progress dispatcher: handles BOTH pipeline stage callbacks
-            #    (stage, status, percent, message) AND DDSP segment callbacks
-            #    (current_seg, total_segs).  The pipeline passes the same
-            #    callback all the way down to DDSP, so we detect the signature.
-            def _dispatcher(*args):
-                if len(args) == 2 and isinstance(args[0], int) and isinstance(args[1], int):
-                    # DDSP segment-level: (current, total)
-                    current, total = args
-                    pct = 48.0 + (current / max(total, 1)) * 40.0
-                    pct = min(pct, 88.0)
-                    self.update_task(
-                        task_id,
+        # Progress dispatcher: handles BOTH pipeline stage callbacks
+        # and DDSP segment callbacks.
+        def _dispatcher(*args):
+            if len(args) == 2 and isinstance(args[0], int) and isinstance(args[1], int):
+                # DDSP segment-level: (current, total)
+                current, total = args
+                pct = 48.0 + (current / max(total, 1)) * 40.0
+                pct = min(pct, 88.0)
+                report(
+                    status="running",
+                    progress=round(pct, 1),
+                    stage="timbre_conversion",
+                    message=f"DDSP inference: segment {current}/{total}",
+                )
+            elif len(args) >= 4:
+                # Pipeline stage-level: (stage, status, percent, message)
+                stage, status, pct, msg = args[0], args[1], args[2], args[3]
+                if status == "error":
+                    current_task = self._tasks.get(task_id)
+                    report(
+                        status="failed",
+                        progress=current_task.progress if current_task else 0.0,
+                        stage=stage,
+                        message=msg,
+                    )
+                else:
+                    current_task = self._tasks.get(task_id)
+                    report(
                         status="running",
-                        progress=round(pct, 1),
-                        stage="timbre_conversion",
-                        message=f"DDSP inference: segment {current}/{total}",
+                        progress=pct if pct >= 0 else (current_task.progress if current_task else 0.0),
+                        stage=stage,
+                        message=msg,
                     )
-                elif len(args) >= 4:
-                    # Pipeline stage-level: (stage, status, percent, message)
-                    stage, status, pct, msg = args[0], args[1], args[2], args[3]
-                    if status == "error":
-                        self.update_task(
-                            task_id,
-                            status="failed",
-                            progress=task.progress,
-                            stage=stage,
-                            message=msg,
+
+        # Build and run the pipeline
+        _saved_cwd = os.getcwd()
+        os.chdir(str(_PROJECT_ROOT))
+
+        # Per-task file logging
+        task_dir = output_dir.parent  # uploads/<task_id>
+        log_handler = _TaskLogHandler(task_dir / "task.log")
+        root_logger = logging.getLogger()
+        root_logger.addHandler(log_handler)
+        stage_timings: Dict[str, Dict[str, Any]] = {}
+        _stage_start_time = time.time()
+
+        final_status = "completed"
+        try:
+            pipeline = SongCoverPipeline(config)
+
+            # Web tasks always start fresh (no resume)
+            if pipeline._checkpoint_file.is_file():
+                pipeline._checkpoint_file.unlink()
+                pipeline._completed_stages = set()
+
+            # Wrap the dispatcher to track per-stage timing
+            def _dispatcher_with_timing(*args):
+                nonlocal _stage_start_time
+                if len(args) >= 4:
+                    stage, status = args[0], args[1]
+                    if status == "started":
+                        _stage_start_time = time.time()
+                        stage_timings[stage] = {"start": _stage_start_time}
+                    elif status in ("completed", "error") and stage in stage_timings:
+                        stage_timings[stage]["end"] = time.time()
+                        stage_timings[stage]["elapsed"] = round(
+                            time.time() - stage_timings[stage]["start"], 1
                         )
-                    else:
-                        self.update_task(
-                            task_id,
-                            status="running",
-                            progress=pct if pct >= 0 else task.progress,
-                            stage=stage,
-                            message=msg,
-                        )
+                _dispatcher(*args)
 
-            # -- Build and run the pipeline --
-            # IMPORTANT: The pipeline (and DDSP) use relative paths throughout.
-            # They expect CWD to be the project root.  We chdir here and
-            # restore when done — same pattern used by DDSPConverter internally.
-            _saved_cwd = os.getcwd()
-            os.chdir(str(_PROJECT_ROOT))
-
-            # ---- Per-task file logging ----
-            task_dir = output_dir.parent  # uploads/<task_id>
-            log_handler = _TaskLogHandler(task_dir / "task.log")
-            root_logger = logging.getLogger()
-            root_logger.addHandler(log_handler)
-            stage_timings: Dict[str, Dict[str, Any]] = {}
-            _stage_start_time = time.time()
-
-            try:
-                pipeline = SongCoverPipeline(config)
-
-                # Web tasks always start fresh (no resume)
-                if pipeline._checkpoint_file.is_file():
-                    pipeline._checkpoint_file.unlink()
-                    pipeline._completed_stages = set()
-
-                # Wrap the dispatcher to track per-stage timing
-                def _dispatcher_with_timing(*args):
-                    nonlocal _stage_start_time
-                    if len(args) >= 4:
-                        stage, status = args[0], args[1]
-                        if status == "started":
-                            _stage_start_time = time.time()
-                            stage_timings[stage] = {"start": _stage_start_time}
-                        elif status in ("completed", "error") and stage in stage_timings:
-                            stage_timings[stage]["end"] = time.time()
-                            stage_timings[stage]["elapsed"] = round(
-                                time.time() - stage_timings[stage]["start"], 1
-                            )
-                    _dispatcher(*args)
-
-                pipeline.run(progress_callback=_dispatcher_with_timing)
-            finally:
-                root_logger.removeHandler(log_handler)
-                os.chdir(_saved_cwd)
-
-            # ---- Save structured task result ----
-            try:
-                task_result = {
-                    "task_id": task_id,
-                    "task_name": config["task"].get("name", "unnamed"),
-                    "model_ckpt": model_ckpt,
-                    "input_file": str(input_path),
-                    "output_dir": str(output_dir),
-                    "status": "completed",
-                    "stages": stage_timings,
-                    "output_files": {k: str(v) for k, v in output_files.items()},
-                    "started_at": task.started_at,
-                    "finished_at": datetime.now().isoformat(),
-                    "elapsed_total_s": round(
-                        sum(s.get("elapsed", 0) for s in stage_timings.values()), 1
-                    ),
-                    "log_file": str(task_dir / "task.log"),
-                }
-                with open(task_dir / "task_result.json", "w", encoding="utf-8") as f:
-                    json.dump(task_result, f, indent=2, ensure_ascii=False, default=str)
-            except Exception:
-                pass  # non-fatal
-
-            # -- Collect output files (paths relative to output_dir for download URLs) --
-            output_files: Dict[str, str] = {}
-            input_stem = Path(config["task"]["input_song"]).stem
-            cover_rel = Path("04_final_mix") / f"{input_stem}_cover.wav"
-            cover_abs = output_dir / cover_rel
-            if cover_abs.is_file():
-                output_files["cover"] = str(cover_rel)
-
-            # Intermediate files (store as relative paths from output_dir)
-            for stage_dir_name, label in [
-                ("03_timbre_conversion", "converted_vocals"),
-                ("01_harmony_separation", "vocals"),
-                ("01_harmony_separation", "instrumental"),
-                ("02_reverb_separation", "noreverb"),
-                ("02_reverb_separation", "reverb"),
-            ]:
-                stage_dir = output_dir / stage_dir_name
-                if stage_dir.is_dir():
-                    for wav in sorted(stage_dir.glob("*.wav")):
-                        if label not in output_files:
-                            output_files[label] = str(wav.relative_to(output_dir))
-                        break
-
-            self.update_task(
-                task_id,
-                status="completed",
-                progress=100.0,
-                stage="mixing",
-                message="Pipeline complete! Your cover is ready.",
-                output_files=output_files,
-            )
-
-            # ---- Per-task cleanup: delete intermediate stages ----
-            if not keep_intermediates:
-                try:
-                    n = _cleanup_task_intermediates(
-                        output_dir.parent,  # task_dir = uploads/<task_id>
-                        KEEP_STAGES_ON_SUCCESS,
-                    )
-                    if n > 0:
-                        logger.info("Task %s: cleaned %d intermediate stage(s), kept %s",
-                                    task_id, n, KEEP_STAGES_ON_SUCCESS)
-                except Exception:
-                    pass  # cleanup failure is non-fatal
-
+            pipeline.run(progress_callback=_dispatcher_with_timing)
         except Exception as exc:
             logger.exception("Task %s failed", task_id)
-            self.update_task(
-                task_id,
+            final_status = "failed"
+            report(
                 status="failed",
                 error=str(exc),
                 message=f"Error: {exc}",
             )
             # Save structured error result
             try:
-                task_dir = output_dir.parent
                 error_result = {
                     "task_id": task_id,
                     "status": "failed",
@@ -471,11 +548,184 @@ class TaskManager:
                     json.dump(error_result, f, indent=2, ensure_ascii=False, default=str)
             except Exception:
                 pass
+        else:
+            # ---- Save structured task result ----
+            output_files: Dict[str, str] = {}
+            try:
+                input_stem = Path(config["task"]["input_song"]).stem
+                cover_rel = Path("04_final_mix") / f"{input_stem}_cover.wav"
+                cover_abs = output_dir / cover_rel
+                if cover_abs.is_file():
+                    output_files["cover"] = str(cover_rel)
+
+                for stage_dir_name, label in [
+                    ("03_timbre_conversion", "converted_vocals"),
+                    ("01_harmony_separation", "vocals"),
+                    ("01_harmony_separation", "instrumental"),
+                    ("02_reverb_separation", "noreverb"),
+                    ("02_reverb_separation", "reverb"),
+                ]:
+                    stage_dir = output_dir / stage_dir_name
+                    if stage_dir.is_dir():
+                        for wav in sorted(stage_dir.glob("*.wav")):
+                            if label not in output_files:
+                                output_files[label] = str(wav.relative_to(output_dir))
+                            break
+
+                task_result = {
+                    "task_id": task_id,
+                    "task_name": config["task"].get("name", "unnamed"),
+                    "model_ckpt": model_ckpt,
+                    "input_file": str(input_path),
+                    "output_dir": str(output_dir),
+                    "status": "completed",
+                    "stages": stage_timings,
+                    "output_files": {k: str(v) for k, v in output_files.items()},
+                    "started_at": task.started_at if task else None,
+                    "finished_at": datetime.now().isoformat(),
+                    "elapsed_total_s": round(
+                        sum(s.get("elapsed", 0) for s in stage_timings.values()), 1
+                    ),
+                    "log_file": str(task_dir / "task.log"),
+                }
+                with open(task_dir / "task_result.json", "w", encoding="utf-8") as f:
+                    json.dump(task_result, f, indent=2, ensure_ascii=False, default=str)
+            except Exception:
+                pass  # non-fatal
+
+            # Report completion with output files
+            report(
+                status="completed",
+                progress=100.0,
+                stage="mixing",
+                message="Pipeline complete! Your cover is ready.",
+                output_files=output_files,
+            )
+
+            # ---- Per-task cleanup: delete intermediate stages ----
+            if not keep_intermediates:
+                try:
+                    n = _cleanup_task_intermediates(
+                        output_dir.parent,
+                        KEEP_STAGES_ON_SUCCESS,
+                    )
+                    if n > 0:
+                        logger.info("Task %s: cleaned %d intermediate stage(s), kept %s",
+                                    task_id, n, KEEP_STAGES_ON_SUCCESS)
+                except Exception:
+                    pass  # cleanup failure is non-fatal
         finally:
-            # ---- Cleanup under lock ----
+            root_logger.removeHandler(log_handler)
+            os.chdir(_saved_cwd)
+            if task:
+                task.finished_at = datetime.now().isoformat()
+
+        return final_status
+
+    # -- Pipeline execution wrappers --
+
+    def run_task(
+        self,
+        task_id: str,
+        config: dict,
+        input_path: Path,
+        output_dir: Path,
+        model_ckpt: str,
+        keep_intermediates: bool = False,
+    ) -> None:
+        """
+        Run a single pipeline task synchronously in a background thread.
+
+        Acquires the task lock; if another task is already running the
+        current task is immediately marked 'failed' with HTTP 409 semantics.
+        """
+        # ---- Acquire the single-task lock ----
+        if not self._lock.acquire(blocking=False):
+            self.update_task(
+                task_id,
+                status="failed",
+                error="Another task is already running. Please wait for it to complete.",
+                message="Server busy -- another task is in progress.",
+            )
+            return
+
+        self._running_task_id = task_id
+        try:
+            self._execute_single(
+                task_id, config, input_path, output_dir, model_ckpt,
+                keep_intermediates,
+                report=lambda **kw: self.update_task(task_id, **kw),
+            )
+        finally:
             task = self._tasks.get(task_id)
             if task:
                 task.finished_at = datetime.now().isoformat()
+            self._running_task_id = None
+            self._lock.release()
+
+    def run_batch(self, batch_id: str) -> None:
+        """
+        Run all files of a batch sequentially under the single GPU lock.
+
+        Failed files do not stop the batch -- remaining files continue.
+        The batch is marked 'completed' if at least one file succeeded,
+        'failed' only if all files failed or the lock was busy.
+        """
+        if not self._lock.acquire(blocking=False):
+            batch = self._batches.get(batch_id)
+            if batch:
+                batch.status = "failed"
+                batch.error = "Another task is already running. Please wait for it to complete."
+                self._broadcast_batch_state(batch)
+            return
+
+        self._running_task_id = batch_id
+        try:
+            batch = self._batches.get(batch_id)
+            if batch is None:
+                return
+            batch.started_at = datetime.now().isoformat()
+            batch.status = "running"
+            self._broadcast_batch_state(batch)
+
+            for idx, entry in enumerate(batch.files):
+                batch.current_index = idx
+                self._running_task_id = entry.file_id
+
+                def _make_report(_entry, _idx):
+                    def _report(**kw):
+                        self._batch_report(batch, _entry, _idx, kw)
+                    return _report
+
+                status = self._execute_single(
+                    entry.file_id, entry.config, entry.input_path,
+                    entry.output_dir, entry.model_ckpt,
+                    entry.keep_intermediates, _make_report(entry, idx),
+                )
+                if status != "completed":
+                    logger.warning(
+                        "Batch %s: file %s failed -- continuing",
+                        batch_id, entry.input_filename,
+                    )
+
+            # Determine final batch status
+            failed_count = sum(1 for f in batch.files if f.status == "failed")
+            batch.status = "completed" if failed_count < len(batch.files) else "failed"
+            if failed_count == len(batch.files):
+                batch.error = f"All {len(batch.files)} file(s) failed."
+            batch.progress = 100.0
+            batch.finished_at = datetime.now().isoformat()
+            batch.message = f"Batch complete: {len(batch.files) - failed_count}/{len(batch.files)} succeeded"
+            self._broadcast_batch_state(batch)
+        except Exception as exc:
+            logger.exception("Batch %s failed", batch_id)
+            batch = self._batches.get(batch_id)
+            if batch:
+                batch.status = "failed"
+                batch.error = str(exc)
+                batch.finished_at = datetime.now().isoformat()
+                self._broadcast_batch_state(batch)
+        finally:
             self._running_task_id = None
             self._lock.release()
 
@@ -571,7 +821,7 @@ _ALL_STAGE_DIRS = [
 def _cleanup_task_intermediates(task_dir: Path, keep_stages: List[str] = KEEP_STAGES_ON_SUCCESS) -> int:
     """
     Delete intermediate stage directories from a completed task,
-    keeping only the stages listed in `keep_stages`.
+    keeping only the stages listed in ``keep_stages``.
 
     Called immediately after a task completes successfully.
 
@@ -605,7 +855,7 @@ def _cleanup_task_intermediates(task_dir: Path, keep_stages: List[str] = KEEP_ST
 
 def _cleanup_periodic() -> dict:
     """
-    Tiered periodic cleanup — called before accepting new uploads.
+    Tiered periodic cleanup -- called before accepting new uploads.
 
     Deletion order (by urgency):
       1. Intermediates of completed tasks > INTERMEDIATE_RETENTION_HOURS
@@ -648,7 +898,6 @@ def _cleanup_periodic() -> dict:
             continue
         if meta["age_h"] < INTERMEDIATE_RETENTION_HOURS:
             continue
-        # Only clean if the task dir still has intermediate stages
         output_dir = meta["path"] / "output"
         if not output_dir.is_dir():
             continue
@@ -683,7 +932,7 @@ def _cleanup_periodic() -> dict:
             logger.info("Cleanup: removed old task %s (age: %.1f h, freed: %.1f MB)",
                         meta["path"].name, meta["age_h"], size / (1024**2))
 
-    # ---- Phase 4: Disk pressure — aggressive if free space is low ----
+    # ---- Phase 4: Disk pressure -- aggressive if free space is low ----
     try:
         stat = shutil.disk_usage(UPLOADS_DIR)
         free_gb = stat.free / (1024**3)
@@ -691,13 +940,13 @@ def _cleanup_periodic() -> dict:
         free_gb = float("inf")
 
     if free_gb < DISK_PRESSURE_FREE_GB:
-        # Delete oldest COMPLETED tasks first (they have the final output saved)
+        # Delete oldest COMPLETED tasks first
         completed = sorted(
             [m for m in tasks_meta if m["status"] == "completed" and m["path"].is_dir()],
             key=lambda m: m["mtime"],
         )
         for meta in completed:
-            if free_gb >= DISK_PRESSURE_FREE_GB * 1.5:  # overshoot a bit
+            if free_gb >= DISK_PRESSURE_FREE_GB * 1.5:
                 break
             size = _get_dir_size(meta["path"])
             shutil.rmtree(meta["path"], ignore_errors=True)
@@ -733,7 +982,7 @@ def _cleanup_periodic() -> dict:
 
 # Backward-compatible alias
 def _cleanup_old_tasks(max_age_hours: int = TASK_RETENTION_HOURS) -> int:
-    """Legacy wrapper — calls the periodic cleanup and returns total removed."""
+    """Legacy wrapper -- calls the periodic cleanup and returns total removed."""
     result = _cleanup_periodic()
     return result["removed_intermediates"] + result["removed_failed"] + \
            result["removed_old"] + result["disk_pressure_deleted"]
@@ -767,7 +1016,6 @@ def _cleanup_uploads_on_startup() -> dict:
                     logger.info("Startup cleanup: removed %s (%.1f MB)",
                                 entry.name, size / (1024**2))
             elif entry.is_file():
-                # Stray files at the uploads root level
                 size = entry.stat().st_size
                 entry.unlink(missing_ok=True)
                 total_bytes += size
@@ -866,7 +1114,7 @@ def _generate_task_config(
     tc["model_ckpt"] = model_ckpt
 
     # ---- MSST uses torch.compile by default (matches project config) ----
-    # DDSP is NOT compatible with torch.compile — keep it disabled always.
+    # DDSP is NOT compatible with torch.compile -- keep it disabled always.
     # DDSP use_amp also stays off (user reports incompatibility).
     config.setdefault("harmony_separation", {})["use_compile"] = True
     config.setdefault("reverb_separation", {})["use_compile"] = True
@@ -874,7 +1122,7 @@ def _generate_task_config(
     config.setdefault("timbre_conversion", {})["use_amp"] = False
 
     param_map = {
-        # User param key  →  (section, config_key, coerce_type)
+        # User param key  ->  (section, config_key, coerce_type)
         "infer_step":            ("timbre_conversion", "infer_step", int),
         "t_start":               ("timbre_conversion", "t_start", float),
         "method":                ("timbre_conversion", "method", str),
@@ -908,7 +1156,7 @@ def _generate_task_config(
         val = bool(params["use_compile"])
         config.setdefault("harmony_separation", {})["use_compile"] = val
         config.setdefault("reverb_separation", {})["use_compile"] = val
-        # NEVER enable on timbre_conversion — DDSP is incompatible
+        # NEVER enable on timbre_conversion -- DDSP is incompatible
 
     return config
 
@@ -977,7 +1225,7 @@ async def get_defaults():
         "timbre_conversion": {
             "infer_step": tc.get("infer_step", 100),
             "t_start": tc.get("t_start", 0.4),
-            "method": tc.get("method", "euler"),
+            "method": tc.get("method", "rk4"),
             "pitch_extractor": tc.get("pitch_extractor", "rmvpe"),
             "key": tc.get("key", 0),
             "formant_shift": tc.get("formant_shift", 0),
@@ -1015,7 +1263,7 @@ async def upload_file(file: UploadFile = File(...)):
     """
     Upload an input song (audio or video file).
 
-    The file is streamed to disk in chunks — it never resides fully in
+    The file is streamed to disk in chunks -- it never resides fully in
     server memory.  A size limit is enforced to prevent disk exhaustion.
     """
     if not file.filename:
@@ -1036,7 +1284,7 @@ async def upload_file(file: UploadFile = File(...)):
         disk = _get_disk_usage()
         if disk.get("warning"):
             logger.warning(
-                "Uploads directory exceeds %d GB limit — consider cleaning up.",
+                "Uploads directory exceeds %d GB limit -- consider cleaning up.",
                 MAX_TOTAL_UPLOADS_GB,
             )
     except Exception:
@@ -1076,7 +1324,7 @@ async def upload_file(file: UploadFile = File(...)):
 
     file_size_mb = round(total_bytes / (1024 * 1024), 1)
 
-    logger.info("Uploaded: %s (%.1f MB) → %s", file.filename, file_size_mb, upload_id)
+    logger.info("Uploaded: %s (%.1f MB) -> %s", file.filename, file_size_mb, upload_id)
 
     return {
         "upload_id": upload_id,
@@ -1108,7 +1356,7 @@ async def create_task(request: Request):
     upload_id = body.get("upload_id", "")
     params = body.get("params", {})
     keep_intermediates = body.get("keep_intermediates", False)
-    steps = body.get("steps", {})  # {"harmony": true, "reverb": true, "timbre": true}
+    steps = body.get("steps", {})
 
     if not upload_id:
         raise HTTPException(status_code=400, detail="upload_id is required")
@@ -1143,10 +1391,10 @@ async def create_task(request: Request):
 
     # Prevent re-submitting the same upload if a task already exists
     existing = task_manager.get_task(task_id)
-    if existing is not None and existing.status in ("running", "completed"):
+    if existing is not None and existing.status == "running":
         raise HTTPException(
             status_code=409,
-            detail="This upload already has a task. Upload a new file or wait for completion.",
+            detail="This upload is currently being processed. Please wait for it to complete.",
         )
 
     task = task_manager.create_task(
@@ -1154,7 +1402,6 @@ async def create_task(request: Request):
         model_name=model_name,
     )
     # Override the auto-generated ID to match upload_id
-    # (create_task already registered the auto-ID; swap it)
     old_id = task.id
     task.id = task_id
     task_manager._tasks[task_id] = task
@@ -1180,7 +1427,7 @@ async def create_task(request: Request):
     with open(config_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(config, f, allow_unicode=True, default_flow_style=False)
 
-    logger.info("Task %s created — model: %s, input: %s", task_id, model_name, input_path.name)
+    logger.info("Task %s created -- model: %s, input: %s", task_id, model_name, input_path.name)
 
     # If somehow a task is already running (race), catch it in the thread
     if task_manager.is_running():
@@ -1306,7 +1553,7 @@ async def download_output(task_id: str, filename: str):
     """
     Download an output file from a completed task.
 
-    Uses chunked streaming — the file is read from disk in small blocks
+    Uses chunked streaming -- the file is read from disk in small blocks
     so it never fully resides in server memory.  Supports HTTP Range
     requests for resumable downloads.
     """
@@ -1339,7 +1586,7 @@ async def download_output(task_id: str, filename: str):
     )
 
     def _file_iterator(path: Path, chunk_size: int = 1024 * 1024):
-        """Yield file content in chunks — never loads full file into RAM."""
+        """Yield file content in chunks -- never loads full file into RAM."""
         with open(path, "rb") as f:
             while True:
                 chunk = f.read(chunk_size)
@@ -1460,6 +1707,182 @@ async def cleanup_tasks():
 
 
 # ---------------------------------------------------------------------------
+# API: Batch processing
+# ---------------------------------------------------------------------------
+
+@app.post("/api/batch")
+async def create_batch(request: Request):
+    """Create a batch job with multiple upload IDs and start processing."""
+    if task_manager.is_running():
+        raise HTTPException(
+            status_code=409,
+            detail="A task is already running. Please wait for it to complete.",
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    upload_ids = body.get("upload_ids", [])
+    params = body.get("params", {})
+    keep_intermediates = body.get("keep_intermediates", False)
+    steps = body.get("steps", {})
+
+    if not upload_ids or not isinstance(upload_ids, list):
+        raise HTTPException(status_code=400, detail="upload_ids (non-empty list) is required")
+    if len(upload_ids) > MAX_BATCH_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Maximum {MAX_BATCH_FILES} files per batch. Got {len(upload_ids)}.",
+        )
+
+    # Determine model checkpoint (shared across all files)
+    model_ckpt = params.get("model_ckpt", "models/DDSP/paipai.pt")
+    model_path = _resolve_project_path(model_ckpt)
+    if not model_path.is_file():
+        default_model = _PROJECT_ROOT / "models" / "DDSP" / "paipai.pt"
+        if default_model.is_file():
+            model_ckpt = "models/DDSP/paipai.pt"
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model checkpoint not found: {model_ckpt}",
+            )
+
+    # Validate and prepare each file
+    files_meta = []
+    seen_ids = set()
+    for uid in upload_ids:
+        if not isinstance(uid, str) or not uid.strip():
+            raise HTTPException(status_code=400, detail=f"Invalid upload_id: {uid}")
+        uid = uid.strip()
+        if uid in seen_ids:
+            raise HTTPException(status_code=400, detail=f"Duplicate upload_id: {uid}")
+        seen_ids.add(uid)
+
+        upload_dir = UPLOADS_DIR / uid
+        if not upload_dir.is_dir():
+            raise HTTPException(status_code=404, detail=f"Upload not found: {uid}")
+
+        input_files = list(upload_dir.glob("input.*"))
+        if not input_files:
+            raise HTTPException(status_code=404, detail=f"No input file found for upload: {uid}")
+        input_path = input_files[0]
+
+        # Prevent re-submitting already-running/completed tasks
+        existing = task_manager.get_task(uid)
+        if existing is not None and existing.status == "running":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Upload {uid} is currently being processed. Please wait for it to complete.",
+            )
+
+        output_dir = upload_dir / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        config = _generate_task_config(
+            input_path=input_path,
+            output_dir=output_dir,
+            model_ckpt=model_ckpt,
+            params=params,
+            steps=steps,
+        )
+
+        # Save generated config per upload dir
+        config_path = upload_dir / "generated_config.yaml"
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(config, f, allow_unicode=True, default_flow_style=False)
+
+        files_meta.append({
+            "upload_id": uid,
+            "input_filename": input_path.name,
+            "input_path": input_path,
+            "output_dir": output_dir,
+            "config": config,
+            "model_ckpt": model_ckpt,
+            "keep_intermediates": keep_intermediates,
+        })
+
+    # Create batch
+    batch = task_manager.create_batch(files_meta)
+    logger.info("Batch %s created with %d file(s)", batch.id, len(batch.files))
+
+    # Double-check lock (race guard)
+    if task_manager.is_running():
+        raise HTTPException(
+            status_code=409,
+            detail="A task started between checks. Please try again.",
+        )
+
+    # Start batch in background thread
+    thread = threading.Thread(
+        target=task_manager.run_batch,
+        args=(batch.id,),
+        daemon=True,
+        name=f"batch-{batch.id}",
+    )
+    thread.start()
+
+    return {
+        "batch_id": batch.id,
+        "status": "pending",
+        "ws_url": f"/ws/batches/{batch.id}",
+        "files": [
+            {"file_id": f.file_id, "input_filename": f.input_filename, "status": f.status}
+            for f in batch.files
+        ],
+    }
+
+
+@app.get("/api/batches/{batch_id}")
+async def get_batch(batch_id: str):
+    """Get the current state of a batch job (REST polling fallback)."""
+    batch = task_manager.get_batch(batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    payload = task_manager._batch_payload(batch)
+    del payload["type"]  # REST response doesn't need the WS type field
+    return payload
+
+
+@app.websocket("/ws/batches/{batch_id}")
+async def batch_websocket_progress(ws: WebSocket, batch_id: str):
+    """WebSocket endpoint for real-time batch progress updates."""
+    await ws.accept()
+
+    batch = task_manager.get_batch(batch_id)
+    if batch is None:
+        await ws.send_json({"type": "error", "message": "Batch not found"})
+        await ws.close()
+        return
+
+    task_manager.subscribe_batch(batch_id, ws)
+
+    try:
+        # Send current state immediately
+        await ws.send_json(task_manager._batch_payload(batch))
+
+        # Keep connection alive, wait for messages
+        while True:
+            try:
+                data = await ws.receive_text()
+                if data == "ping":
+                    await ws.send_text("pong")
+                elif data == "get_status":
+                    batch = task_manager.get_batch(batch_id)
+                    if batch:
+                        await ws.send_json(task_manager._batch_payload(batch))
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                break
+    finally:
+        task_manager.unsubscribe_batch(batch_id, ws)
+
+
+# ---------------------------------------------------------------------------
 # WebSocket: Progress stream
 # ---------------------------------------------------------------------------
 
@@ -1493,7 +1916,6 @@ async def websocket_progress(ws: WebSocket, task_id: str):
         while True:
             try:
                 data = await ws.receive_text()
-                # Client can send ping to keep alive
                 if data == "ping":
                     await ws.send_text("pong")
                 elif data == "get_status":
@@ -1544,7 +1966,7 @@ def main():
     cleanup_result = _cleanup_uploads_on_startup()
 
     print("=" * 60)
-    print("  Song Cover Pipeline — Web UI Server")
+    print("  Song Cover Pipeline -- Web UI Server")
     print("=" * 60)
     print(f"  Project root:   {_PROJECT_ROOT}")
     print(f"  Listening on:   http://{host}:{port}")

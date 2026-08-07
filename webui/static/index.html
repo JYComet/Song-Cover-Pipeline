@@ -26,20 +26,22 @@
 
         <!-- Sidebar: Configuration -->
         <aside class="sidebar" id="sidebar">
-            <!-- Upload — primary action first -->
+            <!-- Upload -- primary action first -->
             <div class="upload-section">
                 <div class="upload-zone" id="upload-zone">
                     <div class="upload-icon">🎶</div>
                     <p class="upload-text">拖拽音频/视频文件到此处</p>
-                    <p class="upload-hint">支持 WAV, MP3, FLAC, MP4, MKV 等格式</p>
-                    <input type="file" id="file-input" accept="audio/*,video/*" hidden>
+                    <p class="upload-hint">支持 WAV, MP3, FLAC, MP4, MKV 等格式 · 可多选</p>
+                    <input type="file" id="file-input" accept="audio/*,video/*" multiple hidden>
                     <button type="button" class="btn btn-secondary" id="btn-browse">选择文件</button>
                 </div>
-                <div class="upload-info" id="upload-info" style="display:none;">
-                    <span class="file-icon">✅</span>
-                    <span id="upload-filename"></span>
-                    <span class="file-size" id="upload-size"></span>
-                    <button class="btn-icon" id="btn-clear-file" title="清除">✕</button>
+                <!-- File queue (replaces single upload-info) -->
+                <div class="file-queue" id="file-queue" style="display:none;">
+                    <div class="file-queue-header">
+                        <span>📋 文件队列 (<span id="queue-count">0</span>)</span>
+                        <button class="btn-icon" id="btn-clear-queue" title="清空队列">🗑 清空</button>
+                    </div>
+                    <div class="file-queue-list" id="file-queue-list"></div>
                 </div>
             </div>
 
@@ -60,7 +62,7 @@
                 <select id="model-select" class="form-select">
                     <option value="">加载中...</option>
                 </select>
-                <small class="form-hint">选择要替换的目标人声模型</small>
+                <small class="form-hint">选择要替换的目标人声模型（批处理时所有文件共用）</small>
             </div>
 
             <!-- Step Selector -->
@@ -124,8 +126,8 @@
                 <div class="form-group">
                     <label for="param-method">ODE 求解器</label>
                     <select id="param-method" class="form-select">
+                        <option value="rk4">rk4 (更精确，推荐)</option>
                         <option value="euler">euler (更快)</option>
-                        <option value="rk4">rk4 (更精确)</option>
                     </select>
                 </div>
 
@@ -203,7 +205,7 @@
                     <label for="param-segment_batch_size">
                         批处理大小: <span class="param-value" id="val-segment_batch_size">1</span>
                     </label>
-                    <input type="range" id="param-segment_batch_size" class="form-range" min="1" max="8" value="1" step="1">
+                    <input type="range" id="param-segment_batch_size" class="form-range" min="1" max="32" value="1" step="1">
                     <small class="form-hint">DDSP 每批处理的音频片段数 (增大可提升GPU利用率)</small>
                 </div>
 
@@ -255,7 +257,7 @@
             <div class="welcome" id="welcome-state">
                 <div class="welcome-icon">🎧</div>
                 <h2>Song Cover Pipeline</h2>
-                <p>选择一个音色模型，上传一首歌曲，然后点击"开始处理"</p>
+                <p>选择一个音色模型，上传一首或多首歌曲，然后点击"开始处理"</p>
                 <div class="pipeline-flow">
                     <div class="flow-step">
                         <span class="flow-num">1</span>
@@ -292,6 +294,7 @@
                     </div>
                     <p class="progress-message" id="progress-message">正在初始化...</p>
                 </div>
+                <!-- Single-task stage indicators (hidden in batch mode) -->
                 <div class="stage-indicators" id="stage-indicators">
                     <div class="stage-dot" data-stage="extract_audio">音频提取</div>
                     <div class="stage-dot" data-stage="harmony_separation">和声分离</div>
@@ -299,36 +302,53 @@
                     <div class="stage-dot" data-stage="timbre_conversion">音色替换</div>
                     <div class="stage-dot" data-stage="mixing">混音输出</div>
                 </div>
+                <!-- Batch progress section (hidden in single mode) -->
+                <div class="batch-progress-section" id="batch-progress-section" style="display:none;">
+                    <div class="batch-current-file" id="batch-current-file"></div>
+                    <div class="batch-file-list" id="batch-file-list"></div>
+                </div>
             </div>
 
             <!-- Results State -->
             <div class="results" id="results-state" style="display:none;">
                 <h2>✅ 处理完成!</h2>
-                <div class="audio-player-container">
-                    <div class="audio-player">
-                        <button class="btn-play" id="btn-play">▶</button>
-                        <div class="audio-waveform" id="waveform">
-                            <canvas id="waveform-canvas"></canvas>
+                <!-- Single result (hidden in batch mode) -->
+                <div class="single-result" id="single-result">
+                    <div class="audio-player-container">
+                        <div class="audio-player">
+                            <button class="btn-play" id="btn-play">▶</button>
+                            <div class="audio-waveform" id="waveform">
+                                <canvas id="waveform-canvas"></canvas>
+                            </div>
+                            <audio id="audio-player" preload="auto"></audio>
                         </div>
-                        <audio id="audio-player" preload="auto"></audio>
+                        <div class="audio-controls">
+                            <span class="audio-time" id="audio-current">0:00</span>
+                            <input type="range" class="audio-seek" id="audio-seek" value="0" min="0" max="100">
+                            <span class="audio-time" id="audio-duration">0:00</span>
+                            <span class="audio-volume-icon">🔊</span>
+                            <input type="range" class="audio-volume" id="audio-volume" value="80" min="0" max="100">
+                        </div>
                     </div>
-                    <div class="audio-controls">
-                        <span class="audio-time" id="audio-current">0:00</span>
-                        <input type="range" class="audio-seek" id="audio-seek" value="0" min="0" max="100">
-                        <span class="audio-time" id="audio-duration">0:00</span>
-                        <span class="audio-volume-icon">🔊</span>
-                        <input type="range" class="audio-volume" id="audio-volume" value="80" min="0" max="100">
+                    <div class="result-actions">
+                        <button class="btn btn-primary" id="btn-download">💾 下载翻唱</button>
+                        <button class="btn btn-secondary" id="btn-show-log">📋 查看日志</button>
+                        <button class="btn btn-secondary" id="btn-new-task">🔄 重新开始</button>
+                    </div>
+                    <div class="output-files" id="output-files-list" style="display:none;">
+                        <h4>📂 中间文件</h4>
+                        <div id="output-links"></div>
                     </div>
                 </div>
-                <div class="result-actions">
-                    <button class="btn btn-primary" id="btn-download">💾 下载翻唱</button>
-                    <button class="btn btn-secondary" id="btn-show-log">📋 查看日志</button>
-                    <button class="btn btn-secondary" id="btn-new-task">🔄 重新开始</button>
+                <!-- Batch results (hidden in single mode) -->
+                <div class="batch-results" id="batch-results" style="display:none;">
+                    <div class="batch-summary" id="batch-summary"></div>
+                    <div class="batch-results-list" id="batch-results-list"></div>
+                    <div class="result-actions" style="margin-top:20px;">
+                        <button class="btn btn-secondary" id="btn-new-task-batch">🔄 重新开始</button>
+                    </div>
                 </div>
-                <div class="output-files" id="output-files-list" style="display:none;">
-                    <h4>📂 中间文件</h4>
-                    <div id="output-links"></div>
-                </div>
+                <!-- Shared log viewer -->
                 <div class="log-viewer" id="log-viewer-results" style="display:none;">
                     <div class="log-viewer-header">
                         <h4>📋 任务日志</h4>

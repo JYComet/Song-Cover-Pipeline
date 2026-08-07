@@ -971,4 +971,319 @@ body {
     .flow-arrow {
         display: none;
     }
+    .result-card-actions {
+        flex-direction: column;
+    }
+}
+
+/* =========================================================================
+   Batch: File Queue (sidebar)
+   ========================================================================= */
+
+.file-queue {
+    margin-top: 10px;
+}
+
+.file-queue-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    margin-bottom: 8px;
+}
+
+.file-queue-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 240px;
+    overflow-y: auto;
+}
+
+.file-queue-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-size: 0.82rem;
+}
+
+.file-queue-item:hover {
+    background: var(--bg-hover);
+}
+
+.file-icon-small {
+    font-size: 0.9rem;
+    flex-shrink: 0;
+}
+
+.file-queue-item .file-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+}
+
+.file-size-small {
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    flex-shrink: 0;
+}
+
+/* =========================================================================
+   Batch: Status Chips
+   ========================================================================= */
+
+.status-chip {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-weight: 500;
+    flex-shrink: 0;
+    white-space: nowrap;
+}
+
+.chip-uploading {
+    background: var(--bg-input);
+    color: var(--text-muted);
+}
+
+.chip-uploaded {
+    background: var(--accent-glow);
+    color: var(--accent-light);
+}
+
+.chip-processing {
+    background: var(--warning-bg);
+    color: var(--warning);
+    animation: dotPulse 1.5s ease-in-out infinite;
+}
+
+.chip-done {
+    background: var(--success-bg);
+    color: var(--success);
+}
+
+.chip-error {
+    background: var(--danger-bg);
+    color: var(--danger);
+}
+
+/* =========================================================================
+   Batch: Processing View
+   ========================================================================= */
+
+.batch-progress-section {
+    margin-top: 20px;
+}
+
+.batch-current-file {
+    text-align: center;
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--accent-light);
+    margin-bottom: 16px;
+    padding: 8px;
+    background: var(--accent-glow);
+    border-radius: var(--radius-sm);
+}
+
+.batch-file-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-width: 600px;
+    margin: 0 auto;
+}
+
+.batch-file-row {
+    padding: 10px 14px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    transition: border-color var(--transition);
+}
+
+.batch-file-row.processing {
+    border-color: var(--accent);
+    box-shadow: 0 0 10px var(--accent-glow);
+}
+
+.batch-file-row-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.batch-file-row-header .file-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.85rem;
+    color: var(--text-primary);
+}
+
+.batch-file-error {
+    font-size: 0.78rem;
+    color: var(--danger);
+    padding: 6px 10px;
+    background: var(--danger-bg);
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--danger);
+    word-break: break-all;
+}
+
+/* Mini progress bar */
+.mini-progress-bg {
+    width: 100%;
+    height: 6px;
+    background: var(--bg-input);
+    border-radius: 3px;
+    overflow: hidden;
+}
+
+.mini-progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--accent-light));
+    border-radius: 3px;
+    transition: width 0.3s ease;
+}
+
+/* =========================================================================
+   Batch: Results View
+   ========================================================================= */
+
+.batch-results {
+    width: 100%;
+    max-width: 750px;
+}
+
+.batch-summary {
+    text-align: center;
+    font-size: 1rem;
+    color: var(--text-secondary);
+    margin-bottom: 24px;
+    padding: 10px;
+    background: var(--bg-card);
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+}
+
+.batch-results-list {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.result-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px 20px;
+    text-align: left;
+}
+
+.result-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+    gap: 10px;
+}
+
+.result-card-header .file-name {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.result-audio {
+    width: 100%;
+    margin-bottom: 10px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-input);
+}
+
+.result-card-actions {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.btn-sm {
+    padding: 6px 14px;
+    font-size: 0.82rem;
+}
+
+.result-card-error-card {
+    border-color: var(--danger);
+}
+
+.result-card-error-card .batch-file-error {
+    margin-bottom: 10px;
+}
+
+/* Intermediate files dropdown in result cards */
+.intermediates-toggle {
+    margin-top: 10px;
+    border-top: 1px solid var(--border);
+    padding-top: 10px;
+}
+
+.intermediates-toggle summary {
+    cursor: pointer;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    font-weight: 500;
+    user-select: none;
+    padding: 4px 0;
+}
+
+.intermediates-toggle summary:hover {
+    color: var(--text-primary);
+}
+
+.intermediates-list {
+    margin-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.intermediates-list .output-link {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 5px 0;
+    font-size: 0.82rem;
+    border-bottom: 1px solid var(--border);
+}
+
+.intermediates-list .output-link:last-child {
+    border-bottom: none;
+}
+
+.intermediates-list .output-link a {
+    color: var(--accent-light);
+    text-decoration: none;
+    font-size: 0.8rem;
+}
+
+.intermediates-list .output-link a:hover {
+    text-decoration: underline;
 }

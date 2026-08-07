@@ -1,6 +1,7 @@
 /**
- * Song Cover Pipeline — Web UI Application
+ * Song Cover Pipeline -- Web UI Application
  * Vanilla JS, no framework dependencies
+ * Supports both single-file and batch processing
  */
 
 // =========================================================================
@@ -13,9 +14,17 @@ const STATE = {
     status: 'idle',  // idle | uploading | ready | processing | done | error
     audioCtx: null,
     playing: false,
-    _activeSteps: null,  // { harmony: bool, reverb: bool, timbre: bool }
+    _activeSteps: null,
     _pollTimer: null,
+    // Batch mode
+    mode: null,           // null | 'single' | 'batch'
+    batchId: null,
+    batchWs: null,
+    _batchPollTimer: null,
+    files: [],            // [{uploadId, name, sizeMb, status}]
 };
+
+let _pendingFiles = [];  // temporary File references for sequential upload
 
 // =========================================================================
 // DOM References (cached on init)
@@ -35,13 +44,13 @@ function cacheDom() {
         // Sidebar
         modelSelect: $('#model-select'),
         uploadZone: $('#upload-zone'),
-        uploadInfo: $('#upload-info'),
-        uploadFilename: $('#upload-filename'),
-        uploadSize: $('#upload-size'),
         fileInput: $('#file-input'),
         btnBrowse: $('#btn-browse'),
-        btnClearFile: $('#btn-clear-file'),
         btnStart: $('#btn-start'),
+        fileQueue: $('#file-queue'),
+        fileQueueList: $('#file-queue-list'),
+        queueCount: $('#queue-count'),
+        btnClearQueue: $('#btn-clear-queue'),
 
         // Main states
         welcomeState: $('#welcome-state'),
@@ -55,8 +64,12 @@ function cacheDom() {
         progressStage: $('#progress-stage'),
         progressMessage: $('#progress-message'),
         stageIndicators: $('#stage-indicators'),
+        batchProgressSection: $('#batch-progress-section'),
+        batchCurrentFile: $('#batch-current-file'),
+        batchFileList: $('#batch-file-list'),
 
-        // Results
+        // Single result
+        singleResult: $('#single-result'),
         audioPlayer: $('#audio-player'),
         btnPlay: $('#btn-play'),
         audioSeek: $('#audio-seek'),
@@ -68,6 +81,14 @@ function cacheDom() {
         btnShowLog: $('#btn-show-log'),
         outputLinks: $('#output-links'),
         outputFilesList: $('#output-files-list'),
+
+        // Batch results
+        batchResults: $('#batch-results'),
+        batchSummary: $('#batch-summary'),
+        batchResultsList: $('#batch-results-list'),
+        btnNewTaskBatch: $('#btn-new-task-batch'),
+
+        // Shared log viewer
         logViewerResults: $('#log-viewer-results'),
         logContentResults: $('#log-content-results'),
         btnCloseLogResults: $('#btn-close-log-results'),
@@ -106,12 +127,6 @@ function formatTime(seconds) {
     const m = Math.floor(seconds / 60);
     const s = Math.floor(seconds % 60);
     return `${m}:${s.toString().padStart(2, '0')}`;
-}
-
-function formatSize(bytes) {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 async function apiGet(url) {
@@ -162,16 +177,15 @@ async function checkHealth() {
             DOM.gpuBadge.textContent = `🖥 ${data.gpu.device || 'GPU'} (${data.gpu.memory_used_gb || 0}GB/${data.gpu.memory_total_gb || '?'}GB)`;
         } else {
             DOM.gpuBadge.className = 'badge gpu-no';
-            DOM.gpuBadge.textContent = '⚠️ CPU only';
+            DOM.gpuBadge.textContent = '⚠ CPU only';
         }
 
-        // Disk usage
         if (data.disk && !data.disk.error) {
             const d = data.disk;
             const diskEl = $('#disk-badge');
             if (d.warning) {
                 diskEl.className = 'badge gpu-no';
-                diskEl.textContent = `💾 ⚠️ ${d.uploads_size_gb}GB / ${d.max_uploads_gb}GB`;
+                diskEl.textContent = `💾 ⚠ ${d.uploads_size_gb}GB / ${d.max_uploads_gb}GB`;
                 diskEl.title = `Uploads directory is full. Free: ${d.disk_free_gb}GB. Old tasks auto-clean after 24h.`;
             } else {
                 diskEl.className = 'badge';
@@ -186,7 +200,7 @@ async function checkHealth() {
     } catch (err) {
         DOM.serverStatus.className = 'status-dot error';
         DOM.gpuBadge.className = 'badge gpu-no';
-        DOM.gpuBadge.textContent = '⚠️ Server error';
+        DOM.gpuBadge.textContent = '⚠ Server error';
     }
 }
 
@@ -230,8 +244,6 @@ async function loadDefaults() {
     try {
         const data = await apiGet('/api/config/defaults');
         DEFAULT_PARAMS = data;
-
-        // Apply defaults to form
         setRangeVal('param-infer_step', data.timbre_conversion.infer_step);
         setRangeVal('param-t_start', data.timbre_conversion.t_start);
         setRangeVal('param-key', data.timbre_conversion.key);
@@ -247,7 +259,6 @@ async function loadDefaults() {
         setRangeVal('param-f0_min', data.timbre_conversion.f0_min);
         setRangeVal('param-f0_max', data.timbre_conversion.f0_max);
         setRangeVal('param-threshold', data.timbre_conversion.threshold);
-        // MSST torch.compile defaults to ON (matches project config)
         setCheckbox('param-use_compile', true);
         setCheckbox('param-normalize_output', data.mixing.normalize_output);
     } catch (err) {
@@ -257,10 +268,7 @@ async function loadDefaults() {
 
 function setRangeVal(id, value) {
     const el = $(`#${id}`);
-    if (el) {
-        el.value = value;
-        updateRangeLabel(id, value);
-    }
+    if (el) { el.value = value; updateRangeLabel(id, value); }
 }
 
 function setSelectVal(id, value) {
@@ -274,8 +282,7 @@ function setCheckbox(id, checked) {
 }
 
 function updateRangeLabel(id, value) {
-    const labelId = `val-${id.replace('param-', '')}`;
-    const label = $(`#${labelId}`);
+    const label = $(`#val-${id.replace('param-', '')}`);
     if (label) label.textContent = value;
 }
 
@@ -315,30 +322,30 @@ function collectParams() {
 }
 
 // =========================================================================
-// File upload with drag & drop
+// File upload with drag & drop (multi-file support)
 // =========================================================================
+
+const ALLOWED_EXTS = ['wav', 'mp3', 'flac', 'ogg', 'm4a', 'aac', 'wma', 'aiff',
+                      'mp4', 'mkv', 'avi', 'mov', 'flv', 'webm', 'wmv', 'm4v'];
 
 function initUpload() {
     const zone = DOM.uploadZone;
     const input = DOM.fileInput;
 
-    // Browse button
     DOM.btnBrowse.addEventListener('click', (e) => {
         e.stopPropagation();
         input.click();
     });
 
-    // Click zone to browse
     zone.addEventListener('click', () => input.click());
 
-    // File selected via browse
     input.addEventListener('change', () => {
         if (input.files.length > 0) {
-            handleFile(input.files[0]);
+            queueFiles(input.files);
+            input.value = '';
         }
     });
 
-    // Drag events
     zone.addEventListener('dragover', (e) => {
         e.preventDefault();
         zone.classList.add('drag-over');
@@ -350,97 +357,175 @@ function initUpload() {
         e.preventDefault();
         zone.classList.remove('drag-over');
         if (e.dataTransfer.files.length > 0) {
-            handleFile(e.dataTransfer.files[0]);
+            queueFiles(e.dataTransfer.files);
         }
     });
 
-    // Clear file
-    DOM.btnClearFile.addEventListener('click', (e) => {
-        e.stopPropagation();
-        clearFile();
+    DOM.btnClearQueue.addEventListener('click', () => {
+        if (STATE.status === 'processing') return;
+        STATE.files = [];
+        _pendingFiles = [];
+        renderFileQueue();
+        updateStartButton();
     });
 }
 
-async function handleFile(file) {
-    const ext = file.name.split('.').pop().toLowerCase();
-    const allowedExts = ['wav', 'mp3', 'flac', 'ogg', 'm4a', 'aac', 'wma', 'aiff',
-                         'mp4', 'mkv', 'avi', 'mov', 'flv', 'webm', 'wmv', 'm4v'];
+function queueFiles(fileList) {
+    const MAX_BATCH = 50;
 
-    if (!allowedExts.includes(ext)) {
-        showToast(`不支持的文件格式: .${ext}`);
-        return;
+    for (const file of fileList) {
+        const ext = file.name.split('.').pop().toLowerCase();
+        if (!ALLOWED_EXTS.includes(ext)) {
+            showToast(`不支持的文件格式: ${file.name} (.${ext})`, 'warning');
+            continue;
+        }
+
+        if (STATE.files.length + _pendingFiles.length >= MAX_BATCH) {
+            showToast(`最多支持 ${MAX_BATCH} 个文件`, 'warning');
+            break;
+        }
+
+        const allNames = [...STATE.files.map(f => f.name), ..._pendingFiles.map(f => f.name)];
+        if (allNames.includes(file.name)) {
+            showToast(`文件已存在: ${file.name}`, 'warning');
+            continue;
+        }
+
+        _pendingFiles.push(file);
     }
 
-    // Show uploading state
-    DOM.uploadZone.querySelector('.upload-icon').textContent = '⏳';
-    DOM.uploadZone.querySelector('.upload-text').textContent = '上传中...';
+    if (_pendingFiles.length > 0) {
+        drainPendingUploads();
+    }
+}
 
-    try {
+async function drainPendingUploads() {
+    while (_pendingFiles.length > 0) {
+        const file = _pendingFiles.shift();
+
+        const entry = {
+            uploadId: null,
+            name: file.name,
+            sizeMb: (file.size / (1024 * 1024)).toFixed(1),
+            status: 'uploading',
+        };
+        STATE.files.push(entry);
+        renderFileQueue();
+        updateStartButton();
+
         const formData = new FormData();
         formData.append('file', file);
 
-        const resp = await fetch('/api/upload', {
-            method: 'POST',
-            body: formData,
-        });
+        try {
+            const resp = await fetch('/api/upload', {
+                method: 'POST',
+                body: formData,
+            });
 
-        if (!resp.ok) {
-            const err = await resp.json().catch(() => ({ detail: 'Upload failed' }));
-            throw new Error(err.detail || 'Upload failed');
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({ detail: 'Upload failed' }));
+                throw new Error(err.detail || 'Upload failed');
+            }
+
+            const data = await resp.json();
+            entry.uploadId = data.upload_id;
+            entry.name = data.original_name;
+            entry.sizeMb = data.size_mb;
+            entry.status = 'uploaded';
+        } catch (err) {
+            entry.status = 'error';
+            showToast(`上传失败: ${entry.name} - ${err.message}`);
         }
-
-        const data = await resp.json();
-        STATE.uploadId = data.upload_id;
-
-        // Show uploaded state
-        DOM.uploadZone.classList.add('has-file');
-        DOM.uploadZone.querySelector('.upload-icon').textContent = '🎶';
-        DOM.uploadZone.querySelector('.upload-text').textContent = '点击或拖拽替换文件';
-        DOM.uploadInfo.style.display = 'flex';
-        DOM.uploadFilename.textContent = data.original_name;
-        DOM.uploadSize.textContent = `${data.size_mb} MB`;
-
+        renderFileQueue();
         updateStartButton();
-    } catch (err) {
-        showToast('上传失败: ' + err.message);
-        DOM.uploadZone.querySelector('.upload-icon').textContent = '🎶';
-        DOM.uploadZone.querySelector('.upload-text').textContent = '拖拽音频/视频文件到此处';
     }
 }
 
-function clearFile() {
-    STATE.uploadId = null;
-    DOM.uploadZone.classList.remove('has-file');
-    DOM.uploadInfo.style.display = 'none';
-    DOM.uploadZone.querySelector('.upload-icon').textContent = '🎶';
-    DOM.uploadZone.querySelector('.upload-text').textContent = '拖拽音频/视频文件到此处';
-    DOM.fileInput.value = '';
+function renderFileQueue() {
+    if (STATE.files.length === 0) {
+        DOM.fileQueue.style.display = 'none';
+        DOM.fileQueueList.innerHTML = '';
+        return;
+    }
+
+    DOM.fileQueue.style.display = 'block';
+    DOM.queueCount.textContent = STATE.files.length;
+
+    DOM.fileQueueList.innerHTML = STATE.files.map((f, i) => {
+        let statusChip = '';
+        let removeBtn = '';
+        const canRemove = STATE.status !== 'processing';
+
+        switch (f.status) {
+            case 'uploading':
+                statusChip = '<span class="status-chip chip-uploading">⏳ 上传中</span>';
+                break;
+            case 'uploaded':
+                statusChip = '<span class="status-chip chip-uploaded">✅ 已上传</span>';
+                break;
+            case 'error':
+                statusChip = '<span class="status-chip chip-error">❌ 失败</span>';
+                break;
+            default:
+                statusChip = `<span class="status-chip">${f.status}</span>`;
+        }
+
+        if (canRemove) {
+            removeBtn = `<button class="btn-icon" onclick="removeFile(${i})" title="移除">✕</button>`;
+        }
+
+        return `
+            <div class="file-queue-item">
+                <span class="file-icon-small">🎵</span>
+                <span class="file-name" title="${f.name}">${f.name}</span>
+                <span class="file-size-small">${f.sizeMb} MB</span>
+                ${statusChip}
+                ${removeBtn}
+            </div>
+        `;
+    }).join('');
+}
+
+function removeFile(index) {
+    if (STATE.status === 'processing') return;
+    STATE.files.splice(index, 1);
+    renderFileQueue();
     updateStartButton();
 }
 
 function updateStartButton() {
     const hasModel = DOM.modelSelect.value && DOM.modelSelect.value !== '';
-    const hasFile = !!STATE.uploadId;
+    const hasFiles = STATE.files.length > 0 && STATE.files.every(f => f.status === 'uploaded');
     const notRunning = STATE.status !== 'processing';
+    const canStart = hasModel && hasFiles && notRunning;
 
-    DOM.btnStart.disabled = !(hasModel && hasFile && notRunning);
+    DOM.btnStart.disabled = !canStart;
 
-    if (hasModel && hasFile && notRunning) {
-        DOM.btnStart.textContent = '🚀 开始处理';
-    } else if (STATE.status === 'processing') {
+    if (STATE.status === 'processing') {
         DOM.btnStart.textContent = '⏳ 处理中...';
+    } else if (STATE.files.length > 1) {
+        DOM.btnStart.textContent = `🚀 开始批量处理 (${STATE.files.length} 个文件)`;
     } else {
-        DOM.btnStart.textContent = '🚀 开始处理 (请选择模型并上传文件)';
+        DOM.btnStart.textContent = '🚀 开始处理';
     }
 }
 
 // =========================================================================
-// Start processing
+// Start processing (single or batch)
 // =========================================================================
 
 async function startProcessing() {
     if (STATE.status === 'processing') return;
-    if (!STATE.uploadId || !DOM.modelSelect.value) return;
+
+    const uploadedFiles = STATE.files.filter(f => f.status === 'uploaded');
+    if (uploadedFiles.length === 0) {
+        showToast('请先上传文件');
+        return;
+    }
+    if (!DOM.modelSelect.value) {
+        showToast('请选择音色模型');
+        return;
+    }
 
     const params = collectParams();
     if (!params.model_ckpt) {
@@ -448,37 +533,48 @@ async function startProcessing() {
         return;
     }
 
+    if (uploadedFiles.length === 1) {
+        STATE.mode = 'single';
+        STATE.uploadId = uploadedFiles[0].uploadId;
+        await startSingleProcessing(uploadedFiles[0], params);
+    } else {
+        STATE.mode = 'batch';
+        await startBatchProcessing(uploadedFiles, params);
+    }
+}
+
+async function startSingleProcessing(fileEntry, params) {
     try {
         const keepIntermediates = document.getElementById('param-keep_intermediates')?.checked || false;
-        // Collect step selections
         const steps = {
             harmony: document.getElementById('step-harmony')?.checked ?? true,
             reverb: document.getElementById('step-reverb')?.checked ?? true,
             timbre: document.getElementById('step-timbre')?.checked ?? true,
         };
         const data = await apiPost('/api/tasks', {
-            upload_id: STATE.uploadId,
+            upload_id: fileEntry.uploadId,
             params: params,
             keep_intermediates: keepIntermediates,
             steps: steps,
         });
 
         STATE.taskId = data.task_id;
-        STATE._pollTimer = null;  // reset poll timer
-        STATE._activeSteps = steps;  // remember which steps are enabled
+        STATE._pollTimer = null;
+        STATE._activeSteps = steps;
         showState('processing');
         DOM.btnStart.disabled = true;
         DOM.btnStart.textContent = '⏳ 处理中...';
         DOM.serverStatus.className = 'status-dot busy';
 
-        // Reset progress
+        DOM.stageIndicators.style.display = '';
+        DOM.batchProgressSection.style.display = 'none';
+
         DOM.progressFill.style.width = '0%';
         DOM.progressPercent.textContent = '0%';
         DOM.progressStage.textContent = '';
         DOM.progressMessage.textContent = '正在初始化...';
         setupStageDots(steps);
 
-        // Connect WebSocket for progress (with REST polling fallback)
         connectWebSocket(data.task_id);
     } catch (err) {
         showToast('启动任务失败: ' + err.message);
@@ -488,19 +584,56 @@ async function startProcessing() {
     }
 }
 
+async function startBatchProcessing(uploadedFiles, params) {
+    try {
+        const keepIntermediates = document.getElementById('param-keep_intermediates')?.checked || false;
+        const steps = {
+            harmony: document.getElementById('step-harmony')?.checked ?? true,
+            reverb: document.getElementById('step-reverb')?.checked ?? true,
+            timbre: document.getElementById('step-timbre')?.checked ?? true,
+        };
+
+        const data = await apiPost('/api/batch', {
+            upload_ids: uploadedFiles.map(f => f.uploadId),
+            params: params,
+            keep_intermediates: keepIntermediates,
+            steps: steps,
+        });
+
+        STATE.batchId = data.batch_id;
+        STATE._batchPollTimer = null;
+        STATE._activeSteps = steps;
+        showState('processing');
+        DOM.btnStart.disabled = true;
+        DOM.btnStart.textContent = '⏳ 处理中...';
+        DOM.serverStatus.className = 'status-dot busy';
+
+        DOM.stageIndicators.style.display = 'none';
+        DOM.batchProgressSection.style.display = '';
+
+        DOM.progressFill.style.width = '0%';
+        DOM.progressPercent.textContent = '0%';
+        DOM.progressStage.textContent = '';
+        DOM.progressMessage.textContent = '正在初始化批量处理...';
+
+        connectBatchWebSocket(data.batch_id);
+    } catch (err) {
+        showToast('启动批量任务失败: ' + err.message);
+        showState('error');
+        DOM.errorMessage.textContent = err.message;
+        updateStartButton();
+    }
+}
+
 // =========================================================================
-// WebSocket progress (with REST polling fallback)
+// WebSocket progress (single task)
 // =========================================================================
 
 function connectWebSocket(taskId) {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}/ws/tasks/${taskId}`;
-
     let completed = false;
 
-    // ---- Always run REST polling as a safety net ----
-    // Even if WebSocket works, polling guarantees we never miss the
-    // completion message (WS can drop when browser tab is backgrounded).
     const pollTimer = setInterval(async () => {
         if (completed) { clearInterval(pollTimer); return; }
         try {
@@ -526,19 +659,15 @@ function connectWebSocket(taskId) {
     }, 2000);
     STATE._pollTimer = pollTimer;
 
-    // ---- WebSocket as primary (faster updates) ----
     const ws = new WebSocket(wsUrl);
     STATE.ws = ws;
 
-    ws.onopen = () => {
-        console.log('WebSocket connected for task', taskId);
-    };
+    ws.onopen = () => console.log('WebSocket connected for task', taskId);
 
     ws.onmessage = (event) => {
         try {
             const data = JSON.parse(event.data);
             handleProgressMessage(data);
-            // If WS delivers completion, stop polling on next cycle
             if (data.status === 'completed' || data.status === 'failed') {
                 completed = true;
                 if (pollTimer) clearInterval(pollTimer);
@@ -548,59 +677,168 @@ function connectWebSocket(taskId) {
         }
     };
 
-    ws.onerror = () => {
-        console.warn('WebSocket error — REST polling will keep progress alive');
-    };
+    ws.onerror = () => console.warn('WebSocket error -- REST polling fallback active');
+    ws.onclose = () => { console.log('WebSocket closed for task', taskId); STATE.ws = null; };
 
-    ws.onclose = () => {
-        console.log('WebSocket closed for task', taskId);
-        STATE.ws = null;
-        // Polling continues as fallback
-    };
-
-    // Keepalive ping
     const pingInterval = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.send('ping');
-        } else {
-            clearInterval(pingInterval);
-        }
+        if (ws.readyState === WebSocket.OPEN) ws.send('ping');
+        else clearInterval(pingInterval);
     }, 10000);
 }
 
+// =========================================================================
+// WebSocket progress (batch)
+// =========================================================================
+
+function connectBatchWebSocket(batchId) {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/ws/batches/${batchId}`;
+    let completed = false;
+
+    const pollTimer = setInterval(async () => {
+        if (completed) { clearInterval(pollTimer); return; }
+        try {
+            const resp = await fetch(`/api/batches/${batchId}`);
+            if (!resp.ok) return;
+            const data = await resp.json();
+            handleBatchMessage(data);
+            if (data.status === 'completed' || data.status === 'failed') {
+                completed = true;
+                clearInterval(pollTimer);
+                if (STATE.batchWs) { STATE.batchWs.close(); STATE.batchWs = null; }
+            }
+        } catch (e) { /* ignore */ }
+    }, 2000);
+    STATE._batchPollTimer = pollTimer;
+
+    const ws = new WebSocket(wsUrl);
+    STATE.batchWs = ws;
+
+    ws.onopen = () => console.log('Batch WebSocket connected for', batchId);
+
+    ws.onmessage = (event) => {
+        try {
+            const data = JSON.parse(event.data);
+            handleBatchMessage(data);
+            if (data.status === 'completed' || data.status === 'failed') {
+                completed = true;
+                if (pollTimer) clearInterval(pollTimer);
+            }
+        } catch (err) {
+            console.error('Invalid batch WS message:', err);
+        }
+    };
+
+    ws.onerror = () => console.warn('Batch WebSocket error -- REST polling fallback active');
+    ws.onclose = () => { console.log('Batch WebSocket closed for', batchId); STATE.batchWs = null; };
+
+    const pingInterval = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.send('ping');
+        else clearInterval(pingInterval);
+    }, 10000);
+}
+
+// =========================================================================
+// Progress message handlers
+// =========================================================================
+
 function handleProgressMessage(data) {
-    if (data.type === 'progress') {
-        const { status, progress, stage, message, output_files, error } = data;
+    if (data.type !== 'progress') return;
 
-        // Update progress bar
-        const isLoading = /加载|loading/i.test(message || '');
-        const pct = Math.round(progress);
+    const { status, progress, stage, message, output_files, error } = data;
+    const isLoading = /加载|loading/i.test(message || '');
+    const pct = Math.round(progress);
 
-        if (isLoading) {
-            // Indeterminate animation while model loads
-            DOM.progressFill.style.width = '100%';
-            DOM.progressFill.classList.add('indeterminate');
-            DOM.progressPercent.textContent = '...';
-        } else {
-            DOM.progressFill.classList.remove('indeterminate');
-            DOM.progressFill.style.width = `${pct}%`;
-            DOM.progressPercent.textContent = `${pct}%`;
-        }
-        DOM.progressStage.textContent = stage ? formatStageName(stage) : '';
-        DOM.progressMessage.textContent = message || '';
+    if (isLoading) {
+        DOM.progressFill.style.width = '100%';
+        DOM.progressFill.classList.add('indeterminate');
+        DOM.progressPercent.textContent = '...';
+    } else {
+        DOM.progressFill.classList.remove('indeterminate');
+        DOM.progressFill.style.width = `${pct}%`;
+        DOM.progressPercent.textContent = `${pct}%`;
+    }
+    DOM.progressStage.textContent = stage ? formatStageName(stage) : '';
+    DOM.progressMessage.textContent = message || '';
+    DOM.progressMessage.className = 'progress-message' + (isLoading ? ' loading' : '');
+
+    updateStageIndicators(stage, status);
+
+    if (status === 'completed') {
+        onTaskComplete(data);
+    } else if (status === 'failed' || error) {
+        onTaskError(data);
+    }
+}
+
+function handleBatchMessage(data) {
+    const { status, progress, current_index, message, error, files } = data;
+    const isLoading = /加载|loading/i.test(message || '');
+    const pct = Math.round(progress);
+
+    if (isLoading) {
+        DOM.progressFill.style.width = '100%';
+        DOM.progressFill.classList.add('indeterminate');
+        DOM.progressPercent.textContent = '...';
+    } else {
+        DOM.progressFill.classList.remove('indeterminate');
+        DOM.progressFill.style.width = `${pct}%`;
+        DOM.progressPercent.textContent = `${pct}%`;
+    }
+
+    if (files && files.length > 0 && current_index < files.length) {
+        const current = files[current_index];
+        DOM.batchCurrentFile.textContent = `📄 文件 ${current_index + 1}/${files.length}: ${current.input_filename}`;
+        DOM.progressStage.textContent = current.stage ? formatStageName(current.stage) : '';
+        DOM.progressMessage.textContent = current.message || message || '';
         DOM.progressMessage.className = 'progress-message' + (isLoading ? ' loading' : '');
+    } else {
+        DOM.progressMessage.textContent = message || '';
+    }
 
-        // Update stage indicators
-        updateStageIndicators(stage, status);
+    // Render per-file progress rows
+    if (files && DOM.batchFileList) {
+        DOM.batchFileList.innerHTML = files.map((f, i) => {
+            let chipClass = '', chipText = '';
+            switch (f.status) {
+                case 'completed': chipClass = 'chip-done'; chipText = '✅ 完成'; break;
+                case 'running': chipClass = 'chip-processing'; chipText = '⏳ 处理中'; break;
+                case 'failed': chipClass = 'chip-error'; chipText = '❌ 失败'; break;
+                default: chipText = '等待中';
+            }
 
-        // Check for completion or error
-        // Only explicit 'completed' status triggers completion.
-        // 'failed' tasks have a non-empty error field.
-        if (status === 'completed') {
-            onTaskComplete(data);
-        } else if (status === 'failed' || error) {
-            onTaskError(data);
-        }
+            const isCurrent = i === current_index && f.status === 'running';
+            const rowClass = isCurrent ? 'batch-file-row processing' : 'batch-file-row';
+
+            let miniBar = '';
+            if (f.status === 'running') {
+                miniBar = `<div class="mini-progress-bg"><div class="mini-progress-fill" style="width:${Math.round(f.progress)}%"></div></div>`;
+            } else if (f.status === 'completed') {
+                miniBar = `<div class="mini-progress-bg"><div class="mini-progress-fill" style="width:100%"></div></div>`;
+            }
+
+            let errorText = '';
+            if (f.status === 'failed' && f.error) {
+                errorText = `<div class="batch-file-error">${f.error}</div>`;
+            }
+
+            return `
+                <div class="${rowClass}">
+                    <div class="batch-file-row-header">
+                        <span class="file-name">🎵 ${f.input_filename}</span>
+                        <span class="status-chip ${chipClass}">${chipText}</span>
+                    </div>
+                    ${miniBar}
+                    ${errorText}
+                </div>
+            `;
+        }).join('');
+    }
+
+    if (status === 'completed') {
+        onBatchComplete(data);
+    } else if (status === 'failed') {
+        onBatchError(data);
     }
 }
 
@@ -618,20 +856,7 @@ function formatStageName(stage) {
     return names[stage] || stage;
 }
 
-function resetStageIndicators() {
-    $$('.stage-dot').forEach(dot => {
-        dot.className = 'stage-dot';
-        dot.style.display = '';  // restore visibility
-    });
-}
-
-/**
- * Show/hide stage dots based on which steps the user selected.
- * Dots for disabled steps are hidden so the progress display only
- * shows the steps that will actually execute.
- */
 function setupStageDots(steps) {
-    // Always show extract_audio and mixing
     const visibility = {
         'extract_audio': true,
         'harmony_separation': steps.harmony !== false,
@@ -639,25 +864,20 @@ function setupStageDots(steps) {
         'timbre_conversion': steps.timbre !== false,
         'mixing': true,
     };
-
     $$('.stage-dot').forEach(dot => {
         const ds = dot.dataset.stage;
-        const visible = visibility[ds] !== false;
-        dot.style.display = visible ? '' : 'none';
+        dot.style.display = visibility[ds] !== false ? '' : 'none';
         dot.className = 'stage-dot';
     });
 }
 
 function updateStageIndicators(currentStage, status) {
-    // Only consider visible stage dots
-    const stages = ['extract_audio', 'harmony_separation', 'reverb_separation',
-                    'timbre_conversion', 'mixing'];
+    const stages = ['extract_audio', 'harmony_separation', 'reverb_separation', 'timbre_conversion', 'mixing'];
     const linkedCompletes = new Set(['harmony_separation', 'reverb_separation']);
     let passed = true;
 
     $$('.stage-dot').forEach(dot => {
-        if (dot.style.display === 'none') return;  // skip hidden dots
-
+        if (dot.style.display === 'none') return;
         const ds = dot.dataset.stage;
         if (currentStage === 'linked_separation' && linkedCompletes.has(ds) && passed) {
             dot.className = 'stage-dot active';
@@ -671,6 +891,17 @@ function updateStageIndicators(currentStage, status) {
     });
 }
 
+function resetStageIndicators() {
+    $$('.stage-dot').forEach(dot => {
+        dot.className = 'stage-dot';
+        dot.style.display = '';
+    });
+}
+
+// =========================================================================
+// Single task completion
+// =========================================================================
+
 function onTaskComplete(data) {
     STATE.status = 'done';
     DOM.serverStatus.className = 'status-dot online';
@@ -680,12 +911,13 @@ function onTaskComplete(data) {
         setupAudioPlayer(data.task_id);
         setupDownload(data.task_id);
     }
-
     if (data.output_files) {
         setupOutputFiles(data.task_id, data.output_files);
     }
 
     setupLogButtons(data.task_id);
+    DOM.singleResult.style.display = '';
+    DOM.batchResults.style.display = 'none';
     showState('done');
 }
 
@@ -699,7 +931,110 @@ function onTaskError(data) {
 }
 
 // =========================================================================
-// Audio player
+// Batch completion
+// =========================================================================
+
+function onBatchComplete(data) {
+    STATE.status = 'done';
+    DOM.serverStatus.className = 'status-dot online';
+    updateStartButton();
+
+    DOM.singleResult.style.display = 'none';
+    DOM.batchResults.style.display = '';
+
+    const files = data.files || [];
+    const succeeded = files.filter(f => f.status === 'completed').length;
+    const failed = files.filter(f => f.status === 'failed').length;
+    DOM.batchSummary.textContent = `✅ ${succeeded} 成功 · ❌ ${failed} 失败 · 📁 共 ${files.length} 个文件`;
+
+    DOM.batchResultsList.innerHTML = files.map(f => {
+        if (f.status === 'completed') {
+            const coverFile = f.output_files?.cover || '';
+            const previewUrl = `/api/tasks/${f.file_id}/preview`;
+            const downloadUrl = coverFile
+                ? `/api/tasks/${f.file_id}/output/${encodeURIComponent(coverFile)}`
+                : previewUrl;
+            const coverName = coverFile ? coverFile.split('/').pop() : 'cover.wav';
+
+            // Build intermediate files list (everything except cover)
+            const intermediates = f.output_files
+                ? Object.entries(f.output_files).filter(([k]) => k !== 'cover')
+                : [];
+            let intermediatesHtml = '';
+            if (intermediates.length > 0) {
+                const labelMap = {
+                    'converted_vocals': '音色转换人声',
+                    'vocals': '原始人声',
+                    'instrumental': '伴奏',
+                    'noreverb': '干声(无混响)',
+                    'reverb': '混响',
+                };
+                const rows = intermediates.map(([key, relPath]) => {
+                    const dlUrl = `/api/tasks/${f.file_id}/output/${encodeURIComponent(relPath)}`;
+                    const fname = relPath.split('/').pop();
+                    const label = labelMap[key] || key;
+                    return `<div class="output-link">
+                        <span>📄 ${label}: ${fname}</span>
+                        <a href="${dlUrl}" download>⬇ 下载</a>
+                    </div>`;
+                }).join('');
+                intermediatesHtml = `
+                    <details class="intermediates-toggle">
+                        <summary>📂 中间文件 (${intermediates.length})</summary>
+                        <div class="intermediates-list">${rows}</div>
+                    </details>`;
+            }
+
+            return `
+                <div class="result-card">
+                    <div class="result-card-header">
+                        <span class="file-name">🎵 ${f.input_filename}</span>
+                        <span class="status-chip chip-done">✅ 完成</span>
+                    </div>
+                    <audio controls preload="none" src="${previewUrl}" class="result-audio"></audio>
+                    <div class="result-card-actions">
+                        <a href="${downloadUrl}" download="${coverName}" class="btn btn-primary btn-sm">💾 下载翻唱</a>
+                        <button class="btn btn-secondary btn-sm" onclick="fetchAndShowLog('${f.file_id}', DOM.logViewerResults, DOM.logContentResults)">📋 查看日志</button>
+                    </div>
+                    ${intermediatesHtml}
+                </div>
+            `;
+        } else {
+            return `
+                <div class="result-card result-card-error-card">
+                    <div class="result-card-header">
+                        <span class="file-name">🎵 ${f.input_filename}</span>
+                        <span class="status-chip chip-error">❌ 失败</span>
+                    </div>
+                    <div class="batch-file-error">${f.error || '未知错误'}</div>
+                    <div class="result-card-actions">
+                        <button class="btn btn-secondary btn-sm" onclick="fetchAndShowLog('${f.file_id}', DOM.logViewerResults, DOM.logContentResults)">📋 查看日志</button>
+                    </div>
+                </div>
+            `;
+        }
+    }).join('');
+
+    DOM.logViewerResults.style.display = 'none';
+    showState('done');
+}
+
+function onBatchError(data) {
+    STATE.status = 'error';
+    DOM.serverStatus.className = 'status-dot error';
+    updateStartButton();
+
+    if (data.files && data.files.length > 0) {
+        onBatchComplete(data);
+        showToast('批量处理失败: ' + (data.error || '未知错误'), 'error');
+    } else {
+        showState('error');
+        DOM.errorMessage.textContent = data.error || data.message || '批量处理失败';
+    }
+}
+
+// =========================================================================
+// Audio player (single mode)
 // =========================================================================
 
 function setupAudioPlayer(taskId) {
@@ -708,7 +1043,6 @@ function setupAudioPlayer(taskId) {
     audio.crossOrigin = 'anonymous';
     audio.load();
 
-    // Clone the play button to remove all existing listeners
     const newBtn = DOM.btnPlay.cloneNode(true);
     DOM.btnPlay.parentNode.replaceChild(newBtn, DOM.btnPlay);
     DOM.btnPlay = newBtn;
@@ -727,7 +1061,6 @@ function setupAudioPlayer(taskId) {
         }
     });
 
-    // ---- Waveform drawing ----
     const canvas = document.getElementById('waveform-canvas');
     let waveformData = null;
     let waveformDrawn = false;
@@ -738,13 +1071,12 @@ function setupAudioPlayer(taskId) {
         const W = canvas.width = canvas.offsetWidth * (window.devicePixelRatio || 1);
         const H = canvas.height = canvas.offsetHeight * (window.devicePixelRatio || 1);
 
-        // If we have pre-decoded data, draw it; otherwise show loading bar
         if (waveformData) {
             ctx.clearRect(0, 0, W, H);
             const mid = H / 2;
             const barW = Math.max(1, W / waveformData.length);
-            const playedColor = '#8b7cf0';  // accent-light
-            const pendingColor = '#4a4a6a'; // muted
+            const playedColor = '#8b7cf0';
+            const pendingColor = '#4a4a6a';
             const progress = audio.duration ? (audio.currentTime / audio.duration) : 0;
             for (let i = 0; i < waveformData.length; i++) {
                 const h = waveformData[i] * mid * 0.85;
@@ -754,7 +1086,6 @@ function setupAudioPlayer(taskId) {
             }
             waveformDrawn = true;
         } else {
-            // Placeholder before data loads
             ctx.fillStyle = '#6a6a8a';
             ctx.font = `${Math.min(14, H * 0.4)}px sans-serif`;
             ctx.textAlign = 'center';
@@ -762,10 +1093,8 @@ function setupAudioPlayer(taskId) {
         }
     }
 
-    // Try to decode waveform from audio
     audio.onloadedmetadata = () => {
         DOM.audioDuration.textContent = formatTime(audio.duration);
-        // Use Web Audio API to extract peaks for waveform
         if (!waveformData && window.AudioContext) {
             try {
                 const actx = new AudioContext();
@@ -774,7 +1103,7 @@ function setupAudioPlayer(taskId) {
                     .then(buf => actx.decodeAudioData(buf))
                     .then(decoded => {
                         const ch = decoded.getChannelData(0);
-                        const peaks = 200; // number of bars
+                        const peaks = 200;
                         const step = Math.floor(ch.length / peaks);
                         const data = [];
                         for (let i = 0; i < peaks; i++) {
@@ -788,18 +1117,16 @@ function setupAudioPlayer(taskId) {
                         waveformData = data;
                         drawWaveform();
                     })
-                    .catch(() => { /* waveform not critical */ });
-            } catch (e) { /* ignore */ }
+                    .catch(() => {});
+            } catch (e) {}
         }
         drawWaveform();
     };
 
-    // Update playhead on timeupdate
     audio.ontimeupdate = () => {
         DOM.audioCurrent.textContent = formatTime(audio.currentTime);
         const pct = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0;
         DOM.audioSeek.value = pct;
-        // Redraw waveform to update played region color
         if (waveformData) { waveformDrawn = false; drawWaveform(); }
     };
     audio.onended = () => {
@@ -809,17 +1136,11 @@ function setupAudioPlayer(taskId) {
         waveformDrawn = false;
         drawWaveform();
     };
-    audio.onplay = () => {
-        if (!waveformDrawn) drawWaveform();
-    };
+    audio.onplay = () => { if (!waveformDrawn) drawWaveform(); };
 
-    // Redraw on resize
-    window.addEventListener('resume', () => { waveformDrawn = false; drawWaveform(); });
-
-    // Initial draw
+    window.addEventListener('resize', () => { waveformDrawn = false; drawWaveform(); });
     drawWaveform();
 
-    // Seek
     DOM.audioSeek.oninput = () => {
         if (audio.duration) {
             audio.currentTime = (DOM.audioSeek.value / 100) * audio.duration;
@@ -828,15 +1149,11 @@ function setupAudioPlayer(taskId) {
         }
     };
 
-    // Volume
-    DOM.audioVolume.oninput = () => {
-        audio.volume = DOM.audioVolume.value / 100;
-    };
+    DOM.audioVolume.oninput = () => { audio.volume = DOM.audioVolume.value / 100; };
     audio.volume = DOM.audioVolume.value / 100;
 }
 
 function setupDownload(taskId) {
-    // Clone to remove old listeners
     const newBtn = DOM.btnDownload.cloneNode(true);
     DOM.btnDownload.parentNode.replaceChild(newBtn, DOM.btnDownload);
     DOM.btnDownload = newBtn;
@@ -878,7 +1195,6 @@ async function fetchAndShowLog(taskId, containerEl, contentEl) {
     try {
         const data = await apiGet(`/api/tasks/${taskId}/log`);
         const logText = data.log || '(暂无日志记录)';
-        // Basic syntax highlighting: colorize log level markers
         const highlighted = logText
             .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
             .replace(/\[ERROR\]/g, '<span class="log-ERROR">[ERROR]</span>')
@@ -888,12 +1204,12 @@ async function fetchAndShowLog(taskId, containerEl, contentEl) {
         contentEl.innerHTML = highlighted;
         contentEl.scrollTop = contentEl.scrollHeight;
 
-        // Show summary if available
         if (data.result && data.result.elapsed_total_s) {
-            const summary = document.createElement('div');
-            summary.className = 'log-summary';
-            summary.innerHTML = `<strong>总耗时:</strong> ${data.result.elapsed_total_s.toFixed(1)}s | <strong>日志行数:</strong> ${data.log_lines}`;
-            if (!containerEl.querySelector('.log-summary')) {
+            const existing = containerEl.querySelector('.log-summary');
+            if (!existing) {
+                const summary = document.createElement('div');
+                summary.className = 'log-summary';
+                summary.innerHTML = `<strong>总耗时:</strong> ${data.result.elapsed_total_s.toFixed(1)}s | <strong>日志行数:</strong> ${data.log_lines}`;
                 containerEl.querySelector('.log-viewer-header').appendChild(summary);
             }
         }
@@ -903,7 +1219,6 @@ async function fetchAndShowLog(taskId, containerEl, contentEl) {
 }
 
 function setupLogButtons(taskId) {
-    // Results log
     DOM.btnShowLog.addEventListener('click', () => {
         fetchAndShowLog(taskId, DOM.logViewerResults, DOM.logContentResults);
     });
@@ -911,7 +1226,6 @@ function setupLogButtons(taskId) {
         DOM.logViewerResults.style.display = 'none';
     });
 
-    // Error log (auto-show)
     fetchAndShowLog(taskId, DOM.logViewerError, DOM.logContentError);
     DOM.btnShowErrorLog.addEventListener('click', () => {
         fetchAndShowLog(taskId, DOM.logViewerError, DOM.logContentError);
@@ -929,25 +1243,37 @@ function resetAll() {
     STATE.taskId = null;
     STATE.uploadId = null;
     STATE.playing = false;
-    if (STATE.ws) {
-        STATE.ws.close();
-        STATE.ws = null;
-    }
-    if (STATE._pollTimer) {
-        clearInterval(STATE._pollTimer);
-        STATE._pollTimer = null;
-    }
+    STATE.mode = null;
+    if (STATE.ws) { STATE.ws.close(); STATE.ws = null; }
+    if (STATE._pollTimer) { clearInterval(STATE._pollTimer); STATE._pollTimer = null; }
+
+    STATE.batchId = null;
+    if (STATE.batchWs) { STATE.batchWs.close(); STATE.batchWs = null; }
+    if (STATE._batchPollTimer) { clearInterval(STATE._batchPollTimer); STATE._batchPollTimer = null; }
+
     if (DOM.audioPlayer) {
         DOM.audioPlayer.pause();
         DOM.audioPlayer.src = '';
     }
+
     DOM.progressFill.style.width = '0%';
+    DOM.progressFill.classList.remove('indeterminate');
     DOM.progressPercent.textContent = '0%';
     DOM.progressStage.textContent = '';
     DOM.progressMessage.textContent = '';
+    DOM.batchCurrentFile.textContent = '';
     resetStageIndicators();
+
+    DOM.stageIndicators.style.display = '';
+    DOM.batchProgressSection.style.display = 'none';
+    DOM.singleResult.style.display = '';
+    DOM.batchResults.style.display = 'none';
+    DOM.batchSummary.textContent = '';
+    DOM.batchResultsList.innerHTML = '';
+
     showState('idle');
     updateStartButton();
+
     DOM.btnPlay.textContent = '▶';
     DOM.btnPlay.classList.remove('playing');
     DOM.audioCurrent.textContent = '0:00';
@@ -957,7 +1283,10 @@ function resetAll() {
     DOM.outputLinks.innerHTML = '';
     if (DOM.logViewerResults) DOM.logViewerResults.style.display = 'none';
     if (DOM.logViewerError) DOM.logViewerError.style.display = 'none';
-    clearFile();
+
+    STATE.files = [];
+    _pendingFiles = [];
+    renderFileQueue();
     checkHealth();
 }
 
@@ -966,17 +1295,12 @@ function resetAll() {
 // =========================================================================
 
 function bindEvents() {
-    // Start button
     DOM.btnStart.addEventListener('click', startProcessing);
-
-    // New task / Retry
     DOM.btnNewTask.addEventListener('click', resetAll);
+    DOM.btnNewTaskBatch.addEventListener('click', resetAll);
     DOM.btnRetry.addEventListener('click', resetAll);
-
-    // Model change updates start button
     DOM.modelSelect.addEventListener('change', updateStartButton);
 
-    // Range sliders: update live value display
     $$('.form-range').forEach(range => {
         range.addEventListener('input', () => {
             const id = range.id.replace('param-', '');
@@ -985,7 +1309,6 @@ function bindEvents() {
         });
     });
 
-    // Keyboard shortcut: Space for play/pause
     document.addEventListener('keydown', (e) => {
         if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' ||
             e.target.tagName === 'TEXTAREA') return;
@@ -1012,11 +1335,8 @@ async function init() {
     ]);
 
     updateStartButton();
-
-    // Periodic health check
     setInterval(checkHealth, 30000);
-
-    console.log('Song Cover Pipeline Web UI initialized');
+    console.log('Song Cover Pipeline Web UI initialized (batch support)');
 }
 
 // Boot

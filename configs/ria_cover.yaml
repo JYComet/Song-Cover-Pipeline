@@ -115,7 +115,7 @@ timbre_conversion:
   device: "cuda:0"
   infer_step: 100              # 推理轮 (rounds): ODE sampling steps
   t_start: 0.4                 # 浮动 (float): ODE start time, 0=pure diffusion, 1=pure DDSP
-  method: "euler"              # ODE solver: "euler" (faster) or "rk4" (more accurate)
+  method: "rk4"               # ODE solver: "rk4" (more accurate) or "euler" (faster)
   pitch_extractor: "fcpe"      # F0 extraction: "fcpe" (GPU, fast), "rmvpe", "parselmouth", "dio", "harvest", "crepe"
 
   # Pitch settings
@@ -134,7 +134,7 @@ timbre_conversion:
   # =========================================================================
   use_compile: false            # torch.compile LYNXNet2 + Unit2Control (PyTorch >= 2.0)
   use_amp: false                # FP16 mixed-precision for reflow ODE steps
-  segment_batch_size: 1         # Batch N segments per GPU forward (1=sequential, 4-8 for speed)
+  segment_batch_size: 1         # Batch N segments per GPU forward (1=sequential)
 
 # =============================================================================
 # Stage 4: Final Mixing (混音叠加)
