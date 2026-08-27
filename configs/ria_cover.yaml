@@ -25,10 +25,10 @@ extract_audio:
 # Optimization: Linked Separation
 # When enabled, karaoke and dereverb models run back-to-back with GPU memory
 # pass-through (no intermediate disk write/read). Residual stems (Instrumental,
-# reverb) are computed in STFT domain for higher precision and speed.
+# reverb) are computed by exact in-memory subtraction.
 # =============================================================================
 linked_separation:
-  enabled: true                 # GPU memory pass-through + STFT-domain residuals
+  enabled: true                 # In-memory pass-through + exact direct residuals
 
 # =============================================================================
 # Stage 1: Harmony Separation (和声分离)

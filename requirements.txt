@@ -36,26 +36,20 @@ tqdm>=4.65.0
 # Performance Optimization Guide
 # =============================================================================
 #
-# For maximum speed without quality loss, in order of impact:
+# Quality-preserving optimizations (same models and inference parameters):
 #
-# 1. Install Flash Attention (MSST stages, 30-50% faster):
-#    pip install flash-attn --no-build-isolation
-#
-# 2. Enable torch.compile (DDSP stage, 20-40% faster, PyTorch >= 2.0):
-#    Set `use_compile: true` in config under timbre_conversion.
-#
-# 3. Enable FP16 AMP (DDSP stage, 30-50% faster):
-#    Set `use_amp: true` in config under timbre_conversion.
-#
-# 4. Batch DDSP segments (DDSP stage, 2-4x higher GPU utilization):
-#    Set `segment_batch_size: 4` (or higher if VRAM permits) in config.
-#
-# 5. Use FCPE pitch extractor (faster GPU-based F0 extraction vs RMVPE):
-#    pip install torchfcpe
-#    Set `pitch_extractor: "fcpe"` in config under timbre_conversion.
-#
-# 6. Increase MSST chunk_batch (more VRAM = higher throughput):
+# 1. Increase MSST chunk_batch (more VRAM = higher throughput):
 #    Set `chunk_batch: 16` or higher in config under harmony_separation / reverb_separation.
 #
-# 7. Reduce DDSP infer_step (quality/speed tradeoff, 40-60 is often sufficient):
+# 2. Enable torch.compile after benchmarking warm runs. Compilation preserves
+#    model parameters but has a one-time startup cost and is hardware-dependent.
+#
+# Options that REQUIRE an A/B quality check for the target model/material:
+#
+# - FP16 AMP changes numerical precision.
+# - segment_batch_size > 1 pads unequal segments and can change model context.
+# - FCPE vs RMVPE changes the extracted pitch contour.
+# - Reducing infer_step changes the ODE solution.
+#
+# Example quality/speed tradeoff (not bit-equivalent):
 #    Set `infer_step: 50` in config under timbre_conversion.

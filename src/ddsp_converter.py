@@ -444,7 +444,10 @@ class DDSPConverter:
         )
 
         # ---- Extract (or load cached) F0 ----
-        md5_hash = hashlib.md5(input_file.read_bytes()).hexdigest()
+        # Stream the file into the digest instead of materializing a second
+        # full copy of a potentially large WAV in RAM.  The digest (and thus
+        # existing F0 cache compatibility) remains identical.
+        md5_hash = _md5_file(input_file)
         cache_dir = self.ddsp_project_dir / "cache"
         cache_file = (
             cache_dir
@@ -548,7 +551,15 @@ class DDSPConverter:
             )
 
         # ---- Write output ----
-        sf.write(output_path, result, self._args.data.sampling_rate)
+        # Keep the model output in float32.  soundfile defaults WAV files to
+        # PCM_16, which would quantize the converted vocal before final mixing.
+        sf.write(
+            output_path,
+            result,
+            self._args.data.sampling_rate,
+            format="WAV",
+            subtype="FLOAT",
+        )
         logger.info("Output written: %s (%.1fs)", output_file.name, len(result) / self._args.data.sampling_rate)
 
     # ------------------------------------------------------------------
@@ -570,8 +581,7 @@ class DDSPConverter:
             np.array([[int(self.spk_id)]])
         ).to(self.device)
 
-        result = np.zeros(0)
-        current_length = 0
+        stitcher = _SegmentStitcher(initial_capacity=mask_tensor.shape[-1])
         total_segments = len(segments)
 
         with torch.no_grad():
@@ -621,18 +631,10 @@ class DDSPConverter:
 
                 seg_output = seg_output.squeeze().cpu().numpy()
 
-                # Cross-fade stitching
-                silent_length = (
-                    round(start_frame * block_size) - current_length
-                )
-                if silent_length >= 0:
-                    result = np.append(result, np.zeros(silent_length))
-                    result = np.append(result, seg_output)
-                else:
-                    result = _cross_fade(result, seg_output, current_length + silent_length)
-
-                current_length = (
-                    current_length + silent_length + len(seg_output)
+                # Cross-fade into a reusable buffer.  Repeated np.append here
+                # copies the entire song once per segment (quadratic work).
+                stitcher.add(
+                    round(start_frame * block_size), seg_output
                 )
 
                 # Report progress
@@ -642,7 +644,7 @@ class DDSPConverter:
                     except Exception:
                         pass
 
-        return result
+        return stitcher.finish()
 
     # ------------------------------------------------------------------
     # Batched inference (higher GPU utilization)
@@ -668,14 +670,7 @@ class DDSPConverter:
         import torch
         from tqdm import tqdm
 
-        result = np.zeros(0)
-        current_length = 0
-
-        # Sort segments by length (descending) to minimize padding overhead
-        # within each batch
-        indexed_segments = list(enumerate(segments))
-        # We will process in original order per batch to maintain correct
-        # cross-fade stitching. The sorting is only within each batch.
+        stitcher = _SegmentStitcher(initial_capacity=mask_tensor.shape[-1])
 
         with torch.no_grad():
             total_segments = len(segments)
@@ -751,19 +746,8 @@ class DDSPConverter:
 
                     seg_output = seg_output.cpu().numpy()
 
-                    # Cross-fade stitching
-                    silent_length = (
-                        round(start_frame * block_size) - current_length
-                    )
-                    if silent_length >= 0:
-                        result = np.append(result, np.zeros(silent_length))
-                        result = np.append(result, seg_output)
-                    else:
-                        result = _cross_fade(result, seg_output,
-                                            current_length + silent_length)
-
-                    current_length = (
-                        current_length + silent_length + len(seg_output)
+                    stitcher.add(
+                        round(start_frame * block_size), seg_output
                     )
 
                 i += batch_size
@@ -778,7 +762,7 @@ class DDSPConverter:
 
             pbar.close()
 
-        return result
+        return stitcher.finish()
 
 
 # ------------------------------------------------------------------
@@ -793,13 +777,72 @@ def _load_audio_fast(path: str) -> tuple:
     or (samples,) for mono.
     """
     import soundfile as sf
-    audio, sample_rate = sf.read(str(path))
+    audio, sample_rate = sf.read(str(path), dtype="float32")
     # soundfile returns (samples, channels), we want (channels, samples)
     if audio.ndim == 1:
         pass  # mono: (samples,)
     else:
         audio = audio.T  # (channels, samples)
-    return audio.astype(np.float32), sample_rate
+    return audio, sample_rate
+
+
+def _md5_file(path: str | Path, chunk_size: int = 4 * 1024 * 1024) -> str:
+    """Return an MD5 compatible with ``read_bytes()`` without copying the file."""
+    digest = hashlib.md5()
+    with open(path, "rb") as file_obj:
+        while chunk := file_obj.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+class _SegmentStitcher:
+    """Stitch ordered mono segments without repeatedly copying prior audio.
+
+    The cross-fade formula intentionally matches :func:`_cross_fade`.  The
+    buffer stays float64 to preserve the legacy function's output dtype and
+    arithmetic.
+    """
+
+    def __init__(self, initial_capacity: int = 0):
+        self._buffer = np.zeros(max(0, int(initial_capacity)), dtype=np.float64)
+        self._length = 0
+
+    def _ensure_capacity(self, required: int) -> None:
+        if required <= self._buffer.size:
+            return
+        new_capacity = max(required, max(1024, self._buffer.size * 2))
+        expanded = np.zeros(new_capacity, dtype=np.float64)
+        expanded[: self._length] = self._buffer[: self._length]
+        self._buffer = expanded
+
+    def add(self, start: int, segment: np.ndarray) -> None:
+        """Add one segment at an absolute output-sample offset."""
+        start = int(start)
+        if start < 0:
+            raise ValueError(f"Segment start must be non-negative, got {start}")
+        segment = np.asarray(segment).reshape(-1)
+        end = start + segment.size
+        self._ensure_capacity(end)
+
+        if start >= self._length:
+            # np.zeros already supplies silence between disjoint segments.
+            self._buffer[start:end] = segment
+        else:
+            fade_len = self._length - start
+            if fade_len > segment.size:
+                raise ValueError("A segment cannot end before the previous segment")
+            weights = np.linspace(0, 1.0, num=fade_len, endpoint=True)
+            self._buffer[start : self._length] = (
+                (1 - weights) * self._buffer[start : self._length]
+                + weights * segment[:fade_len]
+            )
+            self._buffer[self._length : end] = segment[fade_len:]
+
+        self._length = end
+
+    def finish(self) -> np.ndarray:
+        """Return a zero-copy view of the populated buffer."""
+        return self._buffer[: self._length]
 
 
 def _split(audio: np.ndarray, sample_rate: float, hop_size: float,

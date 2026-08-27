@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import quote, unquote
 
 # ---------------------------------------------------------------------------
 # Path setup -- project root is the parent of this webui/ directory
@@ -35,7 +36,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import yaml
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 # ---------------------------------------------------------------------------
@@ -368,7 +369,7 @@ class TaskManager:
                 "error": f.error,
             }
             if f.output_files:
-                fd["output_files"] = f.output_files
+                fd["output_files"] = _available_output_files(f.file_id, f.output_files)
             else:
                 fd["output_files"] = None
             files_data.append(fd)
@@ -572,6 +573,29 @@ class TaskManager:
                                 output_files[label] = str(wav.relative_to(output_dir))
                             break
 
+                # Clean up first, then publish the file list.  Otherwise the
+                # UI receives links to intermediate files that are deleted
+                # immediately afterward when ``keep_intermediates`` is off.
+                if not keep_intermediates:
+                    try:
+                        n = _cleanup_task_intermediates(
+                            output_dir.parent,
+                            KEEP_STAGES_ON_SUCCESS,
+                        )
+                        if n > 0:
+                            logger.info("Task %s: cleaned %d intermediate stage(s), kept %s",
+                                        task_id, n, KEEP_STAGES_ON_SUCCESS)
+                    except Exception:
+                        pass  # cleanup failure is non-fatal
+
+                # Only expose files that still exist after cleanup.  This also
+                # handles a partially produced stage without creating 404 links.
+                output_files = {
+                    key: rel_path
+                    for key, rel_path in output_files.items()
+                    if (output_dir / rel_path).is_file()
+                }
+
                 task_result = {
                     "task_id": task_id,
                     "task_name": config["task"].get("name", "unnamed"),
@@ -593,7 +617,7 @@ class TaskManager:
             except Exception:
                 pass  # non-fatal
 
-            # Report completion with output files
+            # Report completion with the final, downloadable file list.
             report(
                 status="completed",
                 progress=100.0,
@@ -602,18 +626,6 @@ class TaskManager:
                 output_files=output_files,
             )
 
-            # ---- Per-task cleanup: delete intermediate stages ----
-            if not keep_intermediates:
-                try:
-                    n = _cleanup_task_intermediates(
-                        output_dir.parent,
-                        KEEP_STAGES_ON_SUCCESS,
-                    )
-                    if n > 0:
-                        logger.info("Task %s: cleaned %d intermediate stage(s), kept %s",
-                                    task_id, n, KEEP_STAGES_ON_SUCCESS)
-                except Exception:
-                    pass  # cleanup failure is non-fatal
         finally:
             root_logger.removeHandler(log_handler)
             os.chdir(_saved_cwd)
@@ -755,6 +767,59 @@ app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _sanitize_filename(name: str) -> str:
+    """
+    Sanitize a user-provided filename for safe disk storage.
+
+    Preserves Unicode (including Chinese), replaces path separators and
+    other unsafe characters with underscores.  Strips leading/trailing
+    whitespace and dots.  Ensures the result is non-empty.
+    """
+    # Replace truly unsafe characters (path separators, null bytes, etc.)
+    unsafe = {'/', '\\', '\x00', ':', '*', '?', '"', '<', '>', '|'}
+    safe = []
+    for ch in name:
+        if ch in unsafe:
+            safe.append('_')
+        else:
+            safe.append(ch)
+    result = ''.join(safe).strip().strip('.')
+    if not result:
+        result = "audio"
+    # Truncate to reasonable length (keep extension intact later)
+    if len(result) > 200:
+        result = result[:200]
+    return result
+
+
+def _find_input_file(upload_dir: Path) -> Optional[Path]:
+    """Find the first audio/video file in an upload directory."""
+    if not upload_dir.is_dir():
+        return None
+    for entry in sorted(upload_dir.iterdir()):
+        if entry.is_file() and entry.suffix.lower() in ALLOWED_EXTS:
+            return entry
+    return None
+
+
+def _available_output_files(task_id: str, output_files: Dict[str, str]) -> Dict[str, str]:
+    """Return only output entries whose files still exist on disk."""
+    output_root = (UPLOADS_DIR / task_id / "output").resolve()
+    available: Dict[str, str] = {}
+    for key, rel_path in (output_files or {}).items():
+        try:
+            relative = Path(rel_path)
+            if relative.is_absolute():
+                continue
+            file_path = (output_root / relative).resolve()
+            file_path.relative_to(output_root)
+            if file_path.is_file():
+                available[key] = str(relative)
+        except (OSError, ValueError, TypeError):
+            continue
+    return available
+
 
 def _resolve_project_path(p: str) -> Path:
     """Resolve a path-relative-to-project-root to an absolute Path."""
@@ -1093,7 +1158,13 @@ def _generate_task_config(
     config["_project_root"] = str(_PROJECT_ROOT)
 
     # ---- Step selection: which pipeline stages to run ----
-    steps = params.get("steps", {})
+    # ``steps`` is sent as a top-level request field by both the single and
+    # batch frontend flows.  Older clients may still put it in ``params``;
+    # support both forms, preferring the explicit function argument.
+    requested_steps = params.get("steps")
+    if requested_steps is None:
+        requested_steps = steps
+    steps = requested_steps if isinstance(requested_steps, dict) else {}
     # Default: all enabled
     config.setdefault("harmony_separation", {})["enabled"] = steps.get("harmony", True)
     config.setdefault("reverb_separation", {})["enabled"]  = steps.get("reverb", True)
@@ -1295,7 +1366,7 @@ async def upload_file(file: UploadFile = File(...)):
     task_upload_dir = UPLOADS_DIR / upload_id
     task_upload_dir.mkdir(parents=True, exist_ok=True)
 
-    safe_filename = f"input{ext}"
+    safe_filename = f"{_sanitize_filename(Path(file.filename).stem)}{ext}"
     file_path = task_upload_dir / safe_filename
     total_bytes = 0
 
@@ -1366,10 +1437,9 @@ async def create_task(request: Request):
         raise HTTPException(status_code=404, detail="Upload not found")
 
     # Find the uploaded file
-    input_files = list(upload_dir.glob("input.*"))
-    if not input_files:
+    input_path = _find_input_file(upload_dir)
+    if input_path is None:
         raise HTTPException(status_code=404, detail="No input file found for this upload")
-    input_path = input_files[0]
 
     # Determine model checkpoint
     model_ckpt = params.get("model_ckpt", "models/DDSP/paipai.pt")
@@ -1496,7 +1566,7 @@ async def get_task(task_id: str):
         "progress": task.progress,
         "stage": task.stage,
         "message": task.message,
-        "output_files": task.output_files,
+        "output_files": _available_output_files(task.id, task.output_files),
         "error": task.error,
         "input_filename": task.input_filename,
         "model_name": task.model_name,
@@ -1566,17 +1636,28 @@ async def download_output(task_id: str, filename: str):
     if task.status != "completed":
         raise HTTPException(status_code=400, detail="Task not yet completed")
 
-    # Try to find the file
+    # Depending on the ASGI server/proxy, percent-encoded path components may
+    # reach the endpoint either decoded or still encoded.
+    filename = unquote(filename)
+
+    # Resolve only paths inside this task's output directory.  The frontend
+    # sends a relative stage path (for example, 04_final_mix/cover.wav).
     upload_dir = UPLOADS_DIR / task_id
     output_dir = upload_dir / "output"
 
-    file_path = output_dir / filename
+    requested_path = Path(filename)
+    if requested_path.is_absolute() or ".." in requested_path.parts:
+        raise HTTPException(status_code=400, detail="Invalid output file path")
+
+    try:
+        output_root = output_dir.resolve()
+        file_path = (output_root / requested_path).resolve()
+        file_path.relative_to(output_root)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid output file path")
+
     if not file_path.is_file():
-        candidates = list(output_dir.rglob(filename))
-        if candidates:
-            file_path = candidates[0]
-        else:
-            raise HTTPException(status_code=404, detail=f"File not found: {filename}")
+        raise HTTPException(status_code=404, detail=f"File not found: {filename}")
 
     file_size = file_path.stat().st_size
     media_type = (
@@ -1594,11 +1675,23 @@ async def download_output(task_id: str, filename: str):
                     break
                 yield chunk
 
+    # HTTP headers are Latin-1, so a raw Chinese filename raises a server
+    # error.  Keep an ASCII fallback and provide the real UTF-8 name via the
+    # RFC 6266 filename* parameter.
+    ascii_name = "".join(
+        ch if 32 <= ord(ch) < 127 and ch not in {'"', "\\"} else "_"
+        for ch in file_path.name
+    ).strip() or "download"
+    content_disposition = (
+        f'attachment; filename="{ascii_name}"; '
+        f"filename*=UTF-8''{quote(file_path.name, safe='')}"
+    )
+
     return StreamingResponse(
         _file_iterator(file_path),
         media_type=media_type,
         headers={
-            "Content-Disposition": f'attachment; filename="{file_path.name}"',
+            "Content-Disposition": content_disposition,
             "Content-Length": str(file_size),
             "Accept-Ranges": "bytes",
             "Cache-Control": "no-cache",
@@ -1651,12 +1744,32 @@ async def preview_audio(task_id: str, request: Request):
 
     if range_header:
         try:
-            range_str = range_header.replace("bytes=", "")
-            parts = range_str.split("-")
-            start = int(parts[0]) if parts[0] else 0
-            end = int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1
+            if not range_header.startswith("bytes=") or "," in range_header:
+                raise ValueError
+            range_str = range_header[6:]
+            start_text, end_text = range_str.split("-", 1)
+            if not start_text and not end_text:
+                raise ValueError
+            if start_text:
+                start = int(start_text)
+                end = int(end_text) if end_text else file_size - 1
+            else:
+                # Suffix range: bytes=-N means the final N bytes.
+                suffix_length = int(end_text)
+                if suffix_length <= 0:
+                    raise ValueError
+                start = max(file_size - suffix_length, 0)
+                end = file_size - 1
+            if start < 0 or start >= file_size:
+                raise ValueError
+            end = min(end, file_size - 1)
+            if end < start:
+                raise ValueError
         except (ValueError, IndexError):
-            start, end = 0, file_size - 1
+            return Response(
+                status_code=416,
+                headers={"Content-Range": f"bytes */{file_size}"},
+            )
 
     chunk_size = end - start + 1
     status_code = 206 if range_header else 200
@@ -1765,10 +1878,9 @@ async def create_batch(request: Request):
         if not upload_dir.is_dir():
             raise HTTPException(status_code=404, detail=f"Upload not found: {uid}")
 
-        input_files = list(upload_dir.glob("input.*"))
-        if not input_files:
+        input_path = _find_input_file(upload_dir)
+        if input_path is None:
             raise HTTPException(status_code=404, detail=f"No input file found for upload: {uid}")
-        input_path = input_files[0]
 
         # Prevent re-submitting already-running/completed tasks
         existing = task_manager.get_task(uid)
@@ -1908,7 +2020,7 @@ async def websocket_progress(ws: WebSocket, task_id: str):
             "progress": task.progress,
             "stage": task.stage,
             "message": task.message,
-            "output_files": task.output_files if task.output_files else None,
+            "output_files": _available_output_files(task.id, task.output_files) or None,
             "error": task.error,
         })
 
@@ -1928,7 +2040,7 @@ async def websocket_progress(ws: WebSocket, task_id: str):
                             "progress": task.progress,
                             "stage": task.stage,
                             "message": task.message,
-                            "output_files": task.output_files if task.output_files else None,
+                            "output_files": _available_output_files(task.id, task.output_files) or None,
                             "error": task.error,
                         })
             except WebSocketDisconnect:

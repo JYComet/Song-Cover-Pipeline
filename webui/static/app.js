@@ -16,15 +16,29 @@ const STATE = {
     playing: false,
     _activeSteps: null,
     _pollTimer: null,
+    _wsPingTimer: null,
+    _terminalTaskId: null,
     // Batch mode
     mode: null,           // null | 'single' | 'batch'
     batchId: null,
     batchWs: null,
     _batchPollTimer: null,
+    _batchWsPingTimer: null,
+    _terminalBatchId: null,
     files: [],            // [{uploadId, name, sizeMb, status}]
+    _uploadAbortController: null,
+    _uploadGeneration: 0,
+    _waveformResizeHandler: null,
+    _waveformAbortController: null,
+    _waveformGeneration: 0,
 };
 
 let _pendingFiles = [];  // temporary File references for sequential upload
+let _uploadDrainPromise = null;
+const MAX_BATCH_FILES = 50;
+const MAX_FILE_SIZE_BYTES = 2 * 1024 * 1024 * 1024;
+const MAX_WAVEFORM_BYTES = 64 * 1024 * 1024;
+const SESSION_STORAGE_KEY = 'song-cover-pipeline-session';
 
 // =========================================================================
 // DOM References (cached on init)
@@ -122,8 +136,82 @@ function showToast(message, type = 'error') {
     }, 4000);
 }
 
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function saveSession() {
+    const session = {
+        mode: STATE.mode,
+        taskId: STATE.taskId,
+        batchId: STATE.batchId,
+        steps: STATE._activeSteps,
+        savedAt: Date.now(),
+    };
+    try {
+        localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
+    } catch (err) {
+        // Storage can be disabled or unavailable in private browsing.
+    }
+}
+
+function clearSession() {
+    try { localStorage.removeItem(SESSION_STORAGE_KEY); } catch (err) {}
+}
+
+function readSession() {
+    try {
+        const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+        if (!raw) return null;
+        const session = JSON.parse(raw);
+        if (!session || !session.savedAt || Date.now() - session.savedAt > 24 * 3600 * 1000) {
+            clearSession();
+            return null;
+        }
+        return session;
+    } catch (err) {
+        clearSession();
+        return null;
+    }
+}
+
+function stopSingleMonitoring() {
+    if (STATE._pollTimer) {
+        clearInterval(STATE._pollTimer);
+        STATE._pollTimer = null;
+    }
+    if (STATE._wsPingTimer) {
+        clearInterval(STATE._wsPingTimer);
+        STATE._wsPingTimer = null;
+    }
+    if (STATE.ws) {
+        STATE.ws.close();
+        STATE.ws = null;
+    }
+}
+
+function stopBatchMonitoring() {
+    if (STATE._batchPollTimer) {
+        clearInterval(STATE._batchPollTimer);
+        STATE._batchPollTimer = null;
+    }
+    if (STATE._batchWsPingTimer) {
+        clearInterval(STATE._batchWsPingTimer);
+        STATE._batchWsPingTimer = null;
+    }
+    if (STATE.batchWs) {
+        STATE.batchWs.close();
+        STATE.batchWs = null;
+    }
+}
+
 function formatTime(seconds) {
-    if (isNaN(seconds)) return '0:00';
+    if (!Number.isFinite(Number(seconds))) return '0:00';
     const m = Math.floor(seconds / 60);
     const s = Math.floor(seconds % 60);
     return `${m}:${s.toString().padStart(2, '0')}`;
@@ -371,17 +459,19 @@ function initUpload() {
 }
 
 function queueFiles(fileList) {
-    const MAX_BATCH = 50;
-
     for (const file of fileList) {
         const ext = file.name.split('.').pop().toLowerCase();
         if (!ALLOWED_EXTS.includes(ext)) {
             showToast(`不支持的文件格式: ${file.name} (.${ext})`, 'warning');
             continue;
         }
+        if (file.size > MAX_FILE_SIZE_BYTES) {
+            showToast(`文件超过 2 GB 限制: ${file.name}`, 'warning');
+            continue;
+        }
 
-        if (STATE.files.length + _pendingFiles.length >= MAX_BATCH) {
-            showToast(`最多支持 ${MAX_BATCH} 个文件`, 'warning');
+        if (STATE.files.length + _pendingFiles.length >= MAX_BATCH_FILES) {
+            showToast(`最多支持 ${MAX_BATCH_FILES} 个文件`, 'warning');
             break;
         }
 
@@ -394,12 +484,16 @@ function queueFiles(fileList) {
         _pendingFiles.push(file);
     }
 
-    if (_pendingFiles.length > 0) {
-        drainPendingUploads();
+    if (_pendingFiles.length > 0 && !_uploadDrainPromise) {
+        _uploadDrainPromise = drainPendingUploads().finally(() => {
+            _uploadDrainPromise = null;
+            if (_pendingFiles.length > 0) queueFiles([]);
+        });
     }
 }
 
 async function drainPendingUploads() {
+    const generation = STATE._uploadGeneration;
     while (_pendingFiles.length > 0) {
         const file = _pendingFiles.shift();
 
@@ -415,12 +509,17 @@ async function drainPendingUploads() {
 
         const formData = new FormData();
         formData.append('file', file);
+        const controller = new AbortController();
+        STATE._uploadAbortController = controller;
 
         try {
             const resp = await fetch('/api/upload', {
                 method: 'POST',
                 body: formData,
+                signal: controller.signal,
             });
+
+            if (generation !== STATE._uploadGeneration) return;
 
             if (!resp.ok) {
                 const err = await resp.json().catch(() => ({ detail: 'Upload failed' }));
@@ -433,9 +532,16 @@ async function drainPendingUploads() {
             entry.sizeMb = data.size_mb;
             entry.status = 'uploaded';
         } catch (err) {
+            if (generation !== STATE._uploadGeneration || err.name === 'AbortError') return;
             entry.status = 'error';
             showToast(`上传失败: ${entry.name} - ${err.message}`);
+        } finally {
+            if (STATE._uploadAbortController === controller) {
+                STATE._uploadAbortController = null;
+            }
         }
+
+        if (generation !== STATE._uploadGeneration) return;
         renderFileQueue();
         updateStartButton();
     }
@@ -477,7 +583,7 @@ function renderFileQueue() {
         return `
             <div class="file-queue-item">
                 <span class="file-icon-small">🎵</span>
-                <span class="file-name" title="${f.name}">${f.name}</span>
+                <span class="file-name" title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</span>
                 <span class="file-size-small">${f.sizeMb} MB</span>
                 ${statusChip}
                 ${removeBtn}
@@ -536,9 +642,11 @@ async function startProcessing() {
     if (uploadedFiles.length === 1) {
         STATE.mode = 'single';
         STATE.uploadId = uploadedFiles[0].uploadId;
+        STATE._terminalTaskId = null;
         await startSingleProcessing(uploadedFiles[0], params);
     } else {
         STATE.mode = 'batch';
+        STATE._terminalBatchId = null;
         await startBatchProcessing(uploadedFiles, params);
     }
 }
@@ -561,6 +669,7 @@ async function startSingleProcessing(fileEntry, params) {
         STATE.taskId = data.task_id;
         STATE._pollTimer = null;
         STATE._activeSteps = steps;
+        saveSession();
         showState('processing');
         DOM.btnStart.disabled = true;
         DOM.btnStart.textContent = '⏳ 处理中...';
@@ -603,6 +712,7 @@ async function startBatchProcessing(uploadedFiles, params) {
         STATE.batchId = data.batch_id;
         STATE._batchPollTimer = null;
         STATE._activeSteps = steps;
+        saveSession();
         showState('processing');
         DOM.btnStart.disabled = true;
         DOM.btnStart.textContent = '⏳ 处理中...';
@@ -625,17 +735,51 @@ async function startBatchProcessing(uploadedFiles, params) {
     }
 }
 
+async function retryProcessing() {
+    if (STATE.status === 'processing') return;
+    const uploadedFiles = STATE.files.filter(f => f.status === 'uploaded');
+    if (uploadedFiles.length === 0) {
+        resetAll();
+        return;
+    }
+
+    stopSingleMonitoring();
+    stopBatchMonitoring();
+    STATE.taskId = null;
+    STATE.batchId = null;
+    STATE._terminalTaskId = null;
+    STATE._terminalBatchId = null;
+    clearSession();
+    await startProcessing();
+}
+
 // =========================================================================
 // WebSocket progress (single task)
 // =========================================================================
 
 function connectWebSocket(taskId) {
+    stopSingleMonitoring();
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}/ws/tasks/${taskId}`;
     let completed = false;
+    let ws = null;
+
+    const finish = () => {
+        if (completed) return;
+        completed = true;
+        if (STATE._pollTimer === pollTimer) {
+            stopSingleMonitoring();
+        } else {
+            clearInterval(pollTimer);
+            if (ws && ws !== STATE.ws) ws.close();
+        }
+    };
 
     const pollTimer = setInterval(async () => {
-        if (completed) { clearInterval(pollTimer); return; }
+        if (completed || STATE.mode !== 'single' || STATE.taskId !== taskId) {
+            finish();
+            return;
+        }
         try {
             const resp = await fetch(`/api/tasks/${taskId}`);
             if (!resp.ok) return;
@@ -651,26 +795,33 @@ function connectWebSocket(taskId) {
                 error: task.error,
             });
             if (task.status === 'completed' || task.status === 'failed') {
-                completed = true;
-                clearInterval(pollTimer);
-                if (STATE.ws) { STATE.ws.close(); STATE.ws = null; }
+                finish();
             }
         } catch (e) { /* ignore */ }
     }, 2000);
     STATE._pollTimer = pollTimer;
 
-    const ws = new WebSocket(wsUrl);
-    STATE.ws = ws;
+    try {
+        ws = new WebSocket(wsUrl);
+        STATE.ws = ws;
+    } catch (err) {
+        console.warn('WebSocket unavailable -- REST polling fallback active', err);
+    }
+
+    if (!ws) return;
 
     ws.onopen = () => console.log('WebSocket connected for task', taskId);
 
     ws.onmessage = (event) => {
+        if (STATE.mode !== 'single' || STATE.taskId !== taskId) {
+            finish();
+            return;
+        }
         try {
             const data = JSON.parse(event.data);
             handleProgressMessage(data);
             if (data.status === 'completed' || data.status === 'failed') {
-                completed = true;
-                if (pollTimer) clearInterval(pollTimer);
+                finish();
             }
         } catch (err) {
             console.error('Invalid WS message:', err);
@@ -678,12 +829,19 @@ function connectWebSocket(taskId) {
     };
 
     ws.onerror = () => console.warn('WebSocket error -- REST polling fallback active');
-    ws.onclose = () => { console.log('WebSocket closed for task', taskId); STATE.ws = null; };
+    ws.onclose = () => {
+        console.log('WebSocket closed for task', taskId);
+        if (STATE.ws === ws) STATE.ws = null;
+    };
 
     const pingInterval = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) ws.send('ping');
-        else clearInterval(pingInterval);
+        else {
+            clearInterval(pingInterval);
+            if (STATE._wsPingTimer === pingInterval) STATE._wsPingTimer = null;
+        }
     }, 10000);
+    STATE._wsPingTimer = pingInterval;
 }
 
 // =========================================================================
@@ -691,38 +849,61 @@ function connectWebSocket(taskId) {
 // =========================================================================
 
 function connectBatchWebSocket(batchId) {
+    stopBatchMonitoring();
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}/ws/batches/${batchId}`;
     let completed = false;
+    let ws = null;
+
+    const finish = () => {
+        if (completed) return;
+        completed = true;
+        if (STATE._batchPollTimer === pollTimer) {
+            stopBatchMonitoring();
+        } else {
+            clearInterval(pollTimer);
+            if (ws && ws !== STATE.batchWs) ws.close();
+        }
+    };
 
     const pollTimer = setInterval(async () => {
-        if (completed) { clearInterval(pollTimer); return; }
+        if (completed || STATE.mode !== 'batch' || STATE.batchId !== batchId) {
+            finish();
+            return;
+        }
         try {
             const resp = await fetch(`/api/batches/${batchId}`);
             if (!resp.ok) return;
             const data = await resp.json();
             handleBatchMessage(data);
             if (data.status === 'completed' || data.status === 'failed') {
-                completed = true;
-                clearInterval(pollTimer);
-                if (STATE.batchWs) { STATE.batchWs.close(); STATE.batchWs = null; }
+                finish();
             }
         } catch (e) { /* ignore */ }
     }, 2000);
     STATE._batchPollTimer = pollTimer;
 
-    const ws = new WebSocket(wsUrl);
-    STATE.batchWs = ws;
+    try {
+        ws = new WebSocket(wsUrl);
+        STATE.batchWs = ws;
+    } catch (err) {
+        console.warn('Batch WebSocket unavailable -- REST polling fallback active', err);
+    }
+
+    if (!ws) return;
 
     ws.onopen = () => console.log('Batch WebSocket connected for', batchId);
 
     ws.onmessage = (event) => {
+        if (STATE.mode !== 'batch' || STATE.batchId !== batchId) {
+            finish();
+            return;
+        }
         try {
             const data = JSON.parse(event.data);
             handleBatchMessage(data);
             if (data.status === 'completed' || data.status === 'failed') {
-                completed = true;
-                if (pollTimer) clearInterval(pollTimer);
+                finish();
             }
         } catch (err) {
             console.error('Invalid batch WS message:', err);
@@ -730,12 +911,19 @@ function connectBatchWebSocket(batchId) {
     };
 
     ws.onerror = () => console.warn('Batch WebSocket error -- REST polling fallback active');
-    ws.onclose = () => { console.log('Batch WebSocket closed for', batchId); STATE.batchWs = null; };
+    ws.onclose = () => {
+        console.log('Batch WebSocket closed for', batchId);
+        if (STATE.batchWs === ws) STATE.batchWs = null;
+    };
 
     const pingInterval = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) ws.send('ping');
-        else clearInterval(pingInterval);
+        else {
+            clearInterval(pingInterval);
+            if (STATE._batchWsPingTimer === pingInterval) STATE._batchWsPingTimer = null;
+        }
     }, 10000);
+    STATE._batchWsPingTimer = pingInterval;
 }
 
 // =========================================================================
@@ -744,10 +932,12 @@ function connectBatchWebSocket(batchId) {
 
 function handleProgressMessage(data) {
     if (data.type !== 'progress') return;
+    if (!data.task_id || STATE.mode !== 'single' || STATE.taskId !== data.task_id) return;
+    if (STATE._terminalTaskId === data.task_id) return;
 
     const { status, progress, stage, message, output_files, error } = data;
     const isLoading = /加载|loading/i.test(message || '');
-    const pct = Math.round(progress);
+    const pct = Number.isFinite(Number(progress)) ? Math.max(0, Math.min(100, Math.round(Number(progress)))) : 0;
 
     if (isLoading) {
         DOM.progressFill.style.width = '100%';
@@ -772,9 +962,12 @@ function handleProgressMessage(data) {
 }
 
 function handleBatchMessage(data) {
+    if (!data.batch_id || STATE.mode !== 'batch' || STATE.batchId !== data.batch_id) return;
+    if (STATE._terminalBatchId === data.batch_id) return;
+
     const { status, progress, current_index, message, error, files } = data;
     const isLoading = /加载|loading/i.test(message || '');
-    const pct = Math.round(progress);
+    const pct = Number.isFinite(Number(progress)) ? Math.max(0, Math.min(100, Math.round(Number(progress)))) : 0;
 
     if (isLoading) {
         DOM.progressFill.style.width = '100%';
@@ -788,7 +981,7 @@ function handleBatchMessage(data) {
 
     if (files && files.length > 0 && current_index < files.length) {
         const current = files[current_index];
-        DOM.batchCurrentFile.textContent = `📄 文件 ${current_index + 1}/${files.length}: ${current.input_filename}`;
+        DOM.batchCurrentFile.textContent = `📄 文件 ${current_index + 1}/${files.length}: ${current.input_filename || ''}`;
         DOM.progressStage.textContent = current.stage ? formatStageName(current.stage) : '';
         DOM.progressMessage.textContent = current.message || message || '';
         DOM.progressMessage.className = 'progress-message' + (isLoading ? ' loading' : '');
@@ -819,13 +1012,13 @@ function handleBatchMessage(data) {
 
             let errorText = '';
             if (f.status === 'failed' && f.error) {
-                errorText = `<div class="batch-file-error">${f.error}</div>`;
+                errorText = `<div class="batch-file-error">${escapeHtml(f.error)}</div>`;
             }
 
             return `
                 <div class="${rowClass}">
                     <div class="batch-file-row-header">
-                        <span class="file-name">🎵 ${f.input_filename}</span>
+                        <span class="file-name">🎵 ${escapeHtml(f.input_filename)}</span>
                         <span class="status-chip ${chipClass}">${chipText}</span>
                     </div>
                     ${miniBar}
@@ -903,14 +1096,23 @@ function resetStageIndicators() {
 // =========================================================================
 
 function onTaskComplete(data) {
+    if (!data.output_files || !data.output_files.cover) {
+        onTaskError({
+            ...data,
+            status: 'failed',
+            error: '任务已完成，但未找到最终翻唱文件。请查看日志后重试。',
+        });
+        return;
+    }
+    if (STATE._terminalTaskId === data.task_id) return;
+    STATE._terminalTaskId = data.task_id;
+    stopSingleMonitoring();
     STATE.status = 'done';
     DOM.serverStatus.className = 'status-dot online';
     updateStartButton();
 
-    if (data.output_files && data.output_files.cover) {
-        setupAudioPlayer(data.task_id);
-        setupDownload(data.task_id);
-    }
+    setupAudioPlayer(data.task_id);
+    setupDownload(data.task_id, data.output_files.cover);
     if (data.output_files) {
         setupOutputFiles(data.task_id, data.output_files);
     }
@@ -922,6 +1124,9 @@ function onTaskComplete(data) {
 }
 
 function onTaskError(data) {
+    if (data.task_id && STATE._terminalTaskId === data.task_id) return;
+    if (data.task_id) STATE._terminalTaskId = data.task_id;
+    stopSingleMonitoring();
     STATE.status = 'error';
     DOM.serverStatus.className = 'status-dot error';
     updateStartButton();
@@ -935,6 +1140,9 @@ function onTaskError(data) {
 // =========================================================================
 
 function onBatchComplete(data) {
+    if (STATE._terminalBatchId === data.batch_id) return;
+    STATE._terminalBatchId = data.batch_id;
+    stopBatchMonitoring();
     STATE.status = 'done';
     DOM.serverStatus.className = 'status-dot online';
     updateStartButton();
@@ -950,11 +1158,23 @@ function onBatchComplete(data) {
     DOM.batchResultsList.innerHTML = files.map(f => {
         if (f.status === 'completed') {
             const coverFile = f.output_files?.cover || '';
+            if (!coverFile) {
+                return `
+                    <div class="result-card result-card-error-card">
+                        <div class="result-card-header">
+                            <span class="file-name">🎵 ${escapeHtml(f.input_filename)}</span>
+                            <span class="status-chip chip-error">⚠️ 缺少输出</span>
+                        </div>
+                        <div class="batch-file-error">任务完成，但未找到最终翻唱文件，请查看日志。</div>
+                        <div class="result-card-actions">
+                            <button class="btn btn-secondary btn-sm" onclick="fetchAndShowLog('${f.file_id}', DOM.logViewerResults, DOM.logContentResults)">📋 查看日志</button>
+                        </div>
+                    </div>
+                `;
+            }
             const previewUrl = `/api/tasks/${f.file_id}/preview`;
-            const downloadUrl = coverFile
-                ? `/api/tasks/${f.file_id}/output/${encodeURIComponent(coverFile)}`
-                : previewUrl;
-            const coverName = coverFile ? coverFile.split('/').pop() : 'cover.wav';
+            const downloadUrl = `/api/tasks/${f.file_id}/output/${encodeURIComponent(coverFile)}`;
+            const coverName = coverFile.split('/').pop();
 
             // Build intermediate files list (everything except cover)
             const intermediates = f.output_files
@@ -974,7 +1194,7 @@ function onBatchComplete(data) {
                     const fname = relPath.split('/').pop();
                     const label = labelMap[key] || key;
                     return `<div class="output-link">
-                        <span>📄 ${label}: ${fname}</span>
+                        <span>📄 ${escapeHtml(label)}: ${escapeHtml(fname)}</span>
                         <a href="${dlUrl}" download>⬇ 下载</a>
                     </div>`;
                 }).join('');
@@ -988,12 +1208,12 @@ function onBatchComplete(data) {
             return `
                 <div class="result-card">
                     <div class="result-card-header">
-                        <span class="file-name">🎵 ${f.input_filename}</span>
+                        <span class="file-name">🎵 ${escapeHtml(f.input_filename)}</span>
                         <span class="status-chip chip-done">✅ 完成</span>
                     </div>
                     <audio controls preload="none" src="${previewUrl}" class="result-audio"></audio>
                     <div class="result-card-actions">
-                        <a href="${downloadUrl}" download="${coverName}" class="btn btn-primary btn-sm">💾 下载翻唱</a>
+                        <a href="${downloadUrl}" download="${escapeHtml(coverName)}" class="btn btn-primary btn-sm">💾 下载翻唱</a>
                         <button class="btn btn-secondary btn-sm" onclick="fetchAndShowLog('${f.file_id}', DOM.logViewerResults, DOM.logContentResults)">📋 查看日志</button>
                     </div>
                     ${intermediatesHtml}
@@ -1003,10 +1223,10 @@ function onBatchComplete(data) {
             return `
                 <div class="result-card result-card-error-card">
                     <div class="result-card-header">
-                        <span class="file-name">🎵 ${f.input_filename}</span>
+                        <span class="file-name">🎵 ${escapeHtml(f.input_filename)}</span>
                         <span class="status-chip chip-error">❌ 失败</span>
                     </div>
-                    <div class="batch-file-error">${f.error || '未知错误'}</div>
+                    <div class="batch-file-error">${escapeHtml(f.error || '未知错误')}</div>
                     <div class="result-card-actions">
                         <button class="btn btn-secondary btn-sm" onclick="fetchAndShowLog('${f.file_id}', DOM.logViewerResults, DOM.logContentResults)">📋 查看日志</button>
                     </div>
@@ -1020,14 +1240,16 @@ function onBatchComplete(data) {
 }
 
 function onBatchError(data) {
-    STATE.status = 'error';
-    DOM.serverStatus.className = 'status-dot error';
-    updateStartButton();
-
+    if (data.batch_id && STATE._terminalBatchId === data.batch_id) return;
     if (data.files && data.files.length > 0) {
         onBatchComplete(data);
         showToast('批量处理失败: ' + (data.error || '未知错误'), 'error');
     } else {
+        if (data.batch_id) STATE._terminalBatchId = data.batch_id;
+        stopBatchMonitoring();
+        STATE.status = 'error';
+        DOM.serverStatus.className = 'status-dot error';
+        updateStartButton();
         showState('error');
         DOM.errorMessage.textContent = data.error || data.message || '批量处理失败';
     }
@@ -1039,8 +1261,22 @@ function onBatchError(data) {
 
 function setupAudioPlayer(taskId) {
     const audio = DOM.audioPlayer;
+    STATE._waveformGeneration += 1;
+    const currentWaveformGeneration = STATE._waveformGeneration;
+    if (STATE._waveformResizeHandler) {
+        window.removeEventListener('resize', STATE._waveformResizeHandler);
+        STATE._waveformResizeHandler = null;
+    }
+    if (STATE._waveformAbortController) {
+        STATE._waveformAbortController.abort();
+        STATE._waveformAbortController = null;
+    }
+    if (STATE.audioCtx) {
+        STATE.audioCtx.close().catch(() => {});
+        STATE.audioCtx = null;
+    }
+
     audio.src = `/api/tasks/${taskId}/preview`;
-    audio.crossOrigin = 'anonymous';
     audio.load();
 
     const newBtn = DOM.btnPlay.cloneNode(true);
@@ -1049,7 +1285,15 @@ function setupAudioPlayer(taskId) {
 
     DOM.btnPlay.addEventListener('click', () => {
         if (audio.paused) {
-            audio.play();
+            const playPromise = audio.play();
+            if (playPromise && typeof playPromise.catch === 'function') {
+                playPromise.catch(() => {
+                    DOM.btnPlay.textContent = '▶';
+                    DOM.btnPlay.classList.remove('playing');
+                    STATE.playing = false;
+                    showToast('音频播放失败，请检查输出文件或稍后重试。');
+                });
+            }
             DOM.btnPlay.textContent = '⏸';
             DOM.btnPlay.classList.add('playing');
             STATE.playing = true;
@@ -1095,21 +1339,33 @@ function setupAudioPlayer(taskId) {
 
     audio.onloadedmetadata = () => {
         DOM.audioDuration.textContent = formatTime(audio.duration);
-        if (!waveformData && window.AudioContext) {
+        if (!waveformData && (window.AudioContext || window.webkitAudioContext)) {
             try {
-                const actx = new AudioContext();
-                fetch(audio.src)
-                    .then(r => r.arrayBuffer())
+                const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+                const actx = new AudioContextClass();
+                STATE.audioCtx = actx;
+                const controller = new AbortController();
+                STATE._waveformAbortController = controller;
+                fetch(audio.src, { signal: controller.signal })
+                    .then(response => {
+                        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                        const contentLength = Number(response.headers.get('content-length'));
+                        if (Number.isFinite(contentLength) && contentLength > MAX_WAVEFORM_BYTES) {
+                            throw new Error('waveform skipped for large audio');
+                        }
+                        return response.arrayBuffer();
+                    })
                     .then(buf => actx.decodeAudioData(buf))
                     .then(decoded => {
+                        if (STATE.audioCtx !== actx || currentWaveformGeneration !== STATE._waveformGeneration) return;
                         const ch = decoded.getChannelData(0);
                         const peaks = 200;
-                        const step = Math.floor(ch.length / peaks);
+                        const step = Math.max(1, Math.ceil(ch.length / peaks));
                         const data = [];
                         for (let i = 0; i < peaks; i++) {
                             let max = 0;
                             const start = i * step;
-                            for (let j = 0; j < step; j++) {
+                            for (let j = 0; j < step && start + j < ch.length; j++) {
                                 max = Math.max(max, Math.abs(ch[start + j] || 0));
                             }
                             data.push(max);
@@ -1117,7 +1373,17 @@ function setupAudioPlayer(taskId) {
                         waveformData = data;
                         drawWaveform();
                     })
-                    .catch(() => {});
+                    .catch(() => {
+                        if (STATE.audioCtx === actx && !waveformData) {
+                            actx.close().catch(() => {});
+                            STATE.audioCtx = null;
+                        }
+                    })
+                    .finally(() => {
+                        if (STATE._waveformAbortController === controller) {
+                            STATE._waveformAbortController = null;
+                        }
+                    });
             } catch (e) {}
         }
         drawWaveform();
@@ -1136,9 +1402,15 @@ function setupAudioPlayer(taskId) {
         waveformDrawn = false;
         drawWaveform();
     };
+    audio.onerror = () => {
+        DOM.btnPlay.textContent = '▶';
+        DOM.btnPlay.classList.remove('playing');
+        STATE.playing = false;
+    };
     audio.onplay = () => { if (!waveformDrawn) drawWaveform(); };
 
-    window.addEventListener('resize', () => { waveformDrawn = false; drawWaveform(); });
+    STATE._waveformResizeHandler = () => { waveformDrawn = false; drawWaveform(); };
+    window.addEventListener('resize', STATE._waveformResizeHandler);
     drawWaveform();
 
     DOM.audioSeek.oninput = () => {
@@ -1153,15 +1425,22 @@ function setupAudioPlayer(taskId) {
     audio.volume = DOM.audioVolume.value / 100;
 }
 
-function setupDownload(taskId) {
+function setupDownload(taskId, coverRelPath) {
     const newBtn = DOM.btnDownload.cloneNode(true);
     DOM.btnDownload.parentNode.replaceChild(newBtn, DOM.btnDownload);
     DOM.btnDownload = newBtn;
 
+    const downloadName = coverRelPath
+        ? coverRelPath.split('/').pop()
+        : `cover_${taskId}.wav`;
+    const downloadUrl = coverRelPath
+        ? `/api/tasks/${taskId}/output/${encodeURIComponent(coverRelPath)}`
+        : `/api/tasks/${taskId}/preview`;
+
     DOM.btnDownload.addEventListener('click', () => {
         const a = document.createElement('a');
-        a.href = `/api/tasks/${taskId}/preview`;
-        a.download = `cover_${taskId}.wav`;
+        a.href = downloadUrl;
+        a.download = downloadName;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -1169,17 +1448,21 @@ function setupDownload(taskId) {
 }
 
 function setupOutputFiles(taskId, outputFiles) {
-    DOM.outputFilesList.style.display = 'block';
-    DOM.outputLinks.innerHTML = '';
+    const entries = Object.entries(outputFiles || {}).filter(([name]) => name !== 'cover');
+    DOM.outputFilesList.style.display = entries.length > 0 ? 'block' : 'none';
+    DOM.outputLinks.replaceChildren();
 
-    Object.entries(outputFiles).forEach(([name, relPath]) => {
+    entries.forEach(([name, relPath]) => {
         const div = document.createElement('div');
         div.className = 'output-link';
         const fileName = relPath.split('/').pop();
-        div.innerHTML = `
-            <span>📄 ${name}: ${fileName}</span>
-            <a href="/api/tasks/${taskId}/output/${encodeURIComponent(relPath)}" download>⬇ 下载</a>
-        `;
+        const label = document.createElement('span');
+        label.textContent = `📄 ${name}: ${fileName}`;
+        const link = document.createElement('a');
+        link.href = `/api/tasks/${taskId}/output/${encodeURIComponent(relPath)}`;
+        link.download = fileName;
+        link.textContent = '⬇ 下载';
+        div.append(label, link);
         DOM.outputLinks.appendChild(div);
     });
 }
@@ -1191,6 +1474,8 @@ function setupOutputFiles(taskId, outputFiles) {
 async function fetchAndShowLog(taskId, containerEl, contentEl) {
     contentEl.textContent = '加载中...';
     containerEl.style.display = 'block';
+    const previousSummary = containerEl.querySelector('.log-summary');
+    if (previousSummary) previousSummary.remove();
 
     try {
         const data = await apiGet(`/api/tasks/${taskId}/log`);
@@ -1204,14 +1489,12 @@ async function fetchAndShowLog(taskId, containerEl, contentEl) {
         contentEl.innerHTML = highlighted;
         contentEl.scrollTop = contentEl.scrollHeight;
 
-        if (data.result && data.result.elapsed_total_s) {
-            const existing = containerEl.querySelector('.log-summary');
-            if (!existing) {
-                const summary = document.createElement('div');
-                summary.className = 'log-summary';
-                summary.innerHTML = `<strong>总耗时:</strong> ${data.result.elapsed_total_s.toFixed(1)}s | <strong>日志行数:</strong> ${data.log_lines}`;
-                containerEl.querySelector('.log-viewer-header').appendChild(summary);
-            }
+        const elapsed = Number(data.result?.elapsed_total_s);
+        if (Number.isFinite(elapsed) && elapsed >= 0) {
+            const summary = document.createElement('div');
+            summary.className = 'log-summary';
+            summary.innerHTML = `<strong>总耗时:</strong> ${elapsed.toFixed(1)}s | <strong>日志行数:</strong> ${Number(data.log_lines) || 0}`;
+            containerEl.querySelector('.log-viewer-header').appendChild(summary);
         }
     } catch (err) {
         contentEl.textContent = '无法加载日志: ' + err.message;
@@ -1219,20 +1502,19 @@ async function fetchAndShowLog(taskId, containerEl, contentEl) {
 }
 
 function setupLogButtons(taskId) {
-    DOM.btnShowLog.addEventListener('click', () => {
+    DOM.btnShowLog.onclick = () => {
         fetchAndShowLog(taskId, DOM.logViewerResults, DOM.logContentResults);
-    });
-    DOM.btnCloseLogResults.addEventListener('click', () => {
+    };
+    DOM.btnCloseLogResults.onclick = () => {
         DOM.logViewerResults.style.display = 'none';
-    });
+    };
 
-    fetchAndShowLog(taskId, DOM.logViewerError, DOM.logContentError);
-    DOM.btnShowErrorLog.addEventListener('click', () => {
+    DOM.btnShowErrorLog.onclick = () => {
         fetchAndShowLog(taskId, DOM.logViewerError, DOM.logContentError);
-    });
-    DOM.btnCloseLogError.addEventListener('click', () => {
+    };
+    DOM.btnCloseLogError.onclick = () => {
         DOM.logViewerError.style.display = 'none';
-    });
+    };
 }
 
 // =========================================================================
@@ -1240,16 +1522,35 @@ function setupLogButtons(taskId) {
 // =========================================================================
 
 function resetAll() {
+    stopSingleMonitoring();
+    stopBatchMonitoring();
+    STATE._uploadGeneration += 1;
+    if (STATE._uploadAbortController) {
+        STATE._uploadAbortController.abort();
+        STATE._uploadAbortController = null;
+    }
+    if (STATE._waveformAbortController) {
+        STATE._waveformAbortController.abort();
+        STATE._waveformAbortController = null;
+    }
+    if (STATE._waveformResizeHandler) {
+        window.removeEventListener('resize', STATE._waveformResizeHandler);
+        STATE._waveformResizeHandler = null;
+    }
+    if (STATE.audioCtx) {
+        STATE.audioCtx.close().catch(() => {});
+        STATE.audioCtx = null;
+    }
+    STATE._waveformGeneration += 1;
+    clearSession();
     STATE.taskId = null;
     STATE.uploadId = null;
     STATE.playing = false;
     STATE.mode = null;
-    if (STATE.ws) { STATE.ws.close(); STATE.ws = null; }
-    if (STATE._pollTimer) { clearInterval(STATE._pollTimer); STATE._pollTimer = null; }
-
     STATE.batchId = null;
-    if (STATE.batchWs) { STATE.batchWs.close(); STATE.batchWs = null; }
-    if (STATE._batchPollTimer) { clearInterval(STATE._batchPollTimer); STATE._batchPollTimer = null; }
+    STATE._activeSteps = null;
+    STATE._terminalTaskId = null;
+    STATE._terminalBatchId = null;
 
     if (DOM.audioPlayer) {
         DOM.audioPlayer.pause();
@@ -1280,7 +1581,7 @@ function resetAll() {
     DOM.audioDuration.textContent = '0:00';
     DOM.audioSeek.value = 0;
     DOM.outputFilesList.style.display = 'none';
-    DOM.outputLinks.innerHTML = '';
+    DOM.outputLinks.replaceChildren();
     if (DOM.logViewerResults) DOM.logViewerResults.style.display = 'none';
     if (DOM.logViewerError) DOM.logViewerError.style.display = 'none';
 
@@ -1288,6 +1589,49 @@ function resetAll() {
     _pendingFiles = [];
     renderFileQueue();
     checkHealth();
+}
+
+async function restoreTaskSession() {
+    const session = readSession();
+    if (!session || !session.mode) return;
+
+    try {
+        if (session.mode === 'single' && session.taskId) {
+            const task = await apiGet(`/api/tasks/${session.taskId}`);
+            STATE.mode = 'single';
+            STATE.taskId = task.task_id;
+            STATE._activeSteps = session.steps || { harmony: true, reverb: true, timbre: true };
+            if (task.status === 'completed' || task.status === 'failed') {
+                handleProgressMessage({ type: 'progress', ...task });
+                return;
+            }
+            showState('processing');
+            DOM.stageIndicators.style.display = '';
+            DOM.batchProgressSection.style.display = 'none';
+            DOM.serverStatus.className = 'status-dot busy';
+            setupStageDots(STATE._activeSteps);
+            connectWebSocket(task.task_id);
+            return;
+        }
+
+        if (session.mode === 'batch' && session.batchId) {
+            const batch = await apiGet(`/api/batches/${session.batchId}`);
+            STATE.mode = 'batch';
+            STATE.batchId = batch.batch_id;
+            STATE._activeSteps = session.steps || { harmony: true, reverb: true, timbre: true };
+            if (batch.status === 'completed' || batch.status === 'failed') {
+                handleBatchMessage({ type: 'batch_progress', ...batch });
+                return;
+            }
+            showState('processing');
+            DOM.stageIndicators.style.display = 'none';
+            DOM.batchProgressSection.style.display = '';
+            DOM.serverStatus.className = 'status-dot busy';
+            connectBatchWebSocket(batch.batch_id);
+        }
+    } catch (err) {
+        clearSession();
+    }
 }
 
 // =========================================================================
@@ -1298,7 +1642,7 @@ function bindEvents() {
     DOM.btnStart.addEventListener('click', startProcessing);
     DOM.btnNewTask.addEventListener('click', resetAll);
     DOM.btnNewTaskBatch.addEventListener('click', resetAll);
-    DOM.btnRetry.addEventListener('click', resetAll);
+    DOM.btnRetry.addEventListener('click', retryProcessing);
     DOM.modelSelect.addEventListener('change', updateStartButton);
 
     $$('.form-range').forEach(range => {
@@ -1335,6 +1679,7 @@ async function init() {
     ]);
 
     updateStartButton();
+    await restoreTaskSession();
     setInterval(checkHealth, 30000);
     console.log('Song Cover Pipeline Web UI initialized (batch support)');
 }

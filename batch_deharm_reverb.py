@@ -17,7 +17,6 @@ Usage:
 
 import argparse
 import logging
-import os
 import sys
 import time
 from pathlib import Path
@@ -31,6 +30,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 SRC_DIR = PROJECT_ROOT / "src"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.audio_utils import compute_residuals
 
 logging.basicConfig(
     level=logging.INFO,
@@ -95,12 +96,12 @@ def find_audio_files(input_dir: Path) -> list[Path]:
 def load_audio(file_path: Path) -> tuple[np.ndarray, int]:
     """Load audio file, return (waveform, sample_rate). waveform shape: (channels, samples)."""
     logger.info("Loading: %s", file_path.name)
-    audio, sr = sf.read(str(file_path))
+    audio, sr = sf.read(str(file_path), dtype="float32")
     if audio.ndim == 1:
         audio = np.expand_dims(audio, axis=0)
     else:
         audio = audio.T  # (samples, channels) -> (channels, samples)
-    return audio.astype(np.float32), sr
+    return audio, sr
 
 
 def process_batch():
@@ -205,7 +206,7 @@ def process_batch():
         output_sr = KARAOKE_CONFIG["output_sample_rate"]
 
         # ── Process each file sequentially ──
-        # Approach: karaoke → keep vocals in RAM → dereverb → STFT residuals
+        # Approach: karaoke → keep vocals in RAM → dereverb → direct residuals
         # This avoids the LinkedMSSTSeparator's STFT pass-through, which has
         # flash attention kernel compatibility issues with torch.compile.
         total_start = time.time()
@@ -225,6 +226,11 @@ def process_batch():
                 audio, sr = load_audio(audio_path)
                 audio_dur = audio.shape[-1] / sr
                 logger.info("Duration: %.1fs, shape=%s, sr=%d", audio_dur, audio.shape, sr)
+                if sr != output_sr:
+                    from src.msst_separator import _resample_fast
+                    logger.info("Resampling input: %d -> %d Hz", sr, output_sr)
+                    audio = _resample_fast(audio, sr, output_sr)
+                    sr = output_sr
 
                 # ── Step 1: Karaoke separation (和声分离) ──
                 logger.info("  [1/3] Karaoke separation...")
@@ -236,17 +242,11 @@ def process_batch():
                 dereverb_waveforms = dereverb.separate(vocals, sr, "noreverb")
                 noreverb = dereverb_waveforms["noreverb"]  # (ch, samples) — dry vocals
 
-                # ── Step 3: Residuals (STFT domain, fallback to time domain) ──
-                logger.info("  [3/3] Computing residuals (STFT domain)...")
-                try:
-                    instrumental, reverb = _compute_residuals_stft(
-                        audio, vocals, noreverb, sr,
-                    )
-                except Exception as stft_err:
-                    logger.warning("  STFT residual failed, falling back to time domain: %s", stft_err)
-                    instrumental, reverb = _compute_residuals_time(
-                        audio, vocals, noreverb,
-                    )
+                # ── Step 3: Exact direct residuals ──
+                logger.info("  [3/3] Computing residuals (direct subtraction)...")
+                instrumental, reverb = compute_residuals(
+                    audio, vocals, noreverb,
+                )
 
                 # ── Save to category directories ──
                 save_wav(noreverb, DIR_VOCALS / f"{song_name}_noreverb.wav", output_sr)
@@ -292,111 +292,6 @@ def save_wav(waveform: np.ndarray, path: Path, sample_rate: int):
     """Save waveform to WAV file. waveform shape: (channels, samples)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(path), waveform.T, sample_rate, format="WAV", subtype="FLOAT")
-
-
-def _compute_residuals_stft(
-    original: np.ndarray,
-    vocals: np.ndarray,
-    noreverb: np.ndarray,
-    sample_rate: int,
-    n_fft: int = 2048,
-    hop_length: int = 512,
-    win_length: int = 2048,
-) -> tuple:
-    """
-    Compute instrumental and reverb residuals in the STFT domain.
-
-    instrumental = original - vocals   (complex STFT domain)
-    reverb       = vocals - noreverb   (complex STFT domain)
-
-    Returns (instrumental, reverb) as numpy arrays.
-    """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    window = torch.hann_window(win_length, device=device)
-
-    def _stft(audio_np):
-        audio_t = torch.from_numpy(audio_np.astype(np.float32)).to(device)
-        stfts = []
-        for ch in range(audio_t.shape[0]):
-            s = torch.stft(
-                audio_t[ch],
-                n_fft=n_fft, hop_length=hop_length, win_length=win_length,
-                window=window, return_complex=True,
-            )
-            stfts.append(s)
-        return stfts
-
-    def _istft(stft_list, length):
-        audios = []
-        for s in stft_list:
-            a = torch.istft(
-                s, n_fft=n_fft, hop_length=hop_length, win_length=win_length,
-                window=window, length=length,
-            )
-            audios.append(a)
-        return torch.stack(audios, dim=0)
-
-    stft_orig = _stft(original)
-    stft_voc = _stft(vocals)
-    stft_dry = _stft(noreverb)
-
-    # Align to minimum time frames
-    min_frames = min(s.shape[-1] for s in stft_orig + stft_voc + stft_dry)
-    stft_orig = [s[..., :min_frames] for s in stft_orig]
-    stft_voc = [s[..., :min_frames] for s in stft_voc]
-    stft_dry = [s[..., :min_frames] for s in stft_dry]
-
-    # Residuals in STFT domain (complex subtraction)
-    stft_inst = [o - v for o, v in zip(stft_orig, stft_voc)]
-    stft_rev = [v - d for v, d in zip(stft_voc, stft_dry)]
-
-    instrumental = _istft(stft_inst, original.shape[-1]).cpu().numpy()
-    reverb = _istft(stft_rev, vocals.shape[-1]).cpu().numpy()
-    return instrumental.astype(np.float32), reverb.astype(np.float32)
-
-
-def _compute_residuals_time(
-    original: np.ndarray,
-    vocals: np.ndarray,
-    noreverb: np.ndarray,
-) -> tuple:
-    """
-    Compute instrumental and reverb residuals in the time domain.
-
-    Fallback when STFT-domain computation fails (e.g. iSTFT window overlap issues).
-    instrumental = original - vocals
-    reverb       = vocals - noreverb
-    """
-    # Align channel counts
-    def _match_channels(ref, other):
-        if ref.shape[0] != other.shape[0]:
-            if ref.shape[0] == 1:
-                return np.repeat(other, ref.shape[0], axis=0)
-            elif other.shape[0] == 1:
-                return np.repeat(ref, other.shape[0], axis=0)
-            else:
-                return other[:ref.shape[0], :]
-        return other
-
-    vocals_m = _match_channels(original, vocals)
-    noreverb_m = _match_channels(original, noreverb)
-
-    # Align lengths
-    min_len_inst = min(original.shape[-1], vocals_m.shape[-1])
-    min_len_rev = min(vocals_m.shape[-1], noreverb_m.shape[-1])
-
-    instrumental = original[:, :min_len_inst] - vocals_m[:, :min_len_inst]
-    reverb = vocals_m[:, :min_len_rev] - noreverb_m[:, :min_len_rev]
-
-    return instrumental.astype(np.float32), reverb.astype(np.float32)
-
-
-def _copy_file(src: Path, dst: Path):
-    """Copy file from src to dst."""
-    import shutil
-    if dst.exists():
-        dst.unlink()
-    shutil.copy2(str(src), str(dst))
 
 
 if __name__ == "__main__":

@@ -20,6 +20,8 @@ import json
 from pathlib import Path
 from typing import Callable, Optional
 
+from src.audio_utils import align_audio_pair, compute_residuals
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -467,12 +469,12 @@ class SongCoverPipeline:
         bandwidth contention), we use a STAGED approach:
           1. Load karaoke → run → keep vocals in RAM → UNLOAD karaoke
           2. Load dereverb → run on in-memory vocals → UNLOAD dereverb
-          3. Compute residuals in STFT domain (fast + precise)
+          3. Compute residuals by exact in-memory subtraction
 
         This avoids:
           - Disk I/O for intermediate vocals.wav
           - GPU memory bandwidth contention (only 1 model on GPU at a time)
-          - librosa-based residual computation (replaced by STFT-domain)
+          - librosa-based residual computation and redundant transforms
         """
         def _p(stage, status, pct, msg):
             if progress_callback:
@@ -504,7 +506,7 @@ class SongCoverPipeline:
         audio = audio.astype(np.float32)
         sample_rate_out = karaoke_cfg.get("output_sample_rate", 44100)
 
-        # Resample original audio to target rate if needed (for STFT residual alignment)
+        # Resample original audio to target rate if needed for residual alignment
         if sr != sample_rate_out:
             logger.info("Resampling original from %d Hz to %d Hz", sr, sample_rate_out)
             from src.msst_separator import _resample_fast
@@ -535,7 +537,7 @@ class SongCoverPipeline:
         finally:
             karaoke.unload_model()
 
-        # Save vocals and compute instrumental from STFT
+        # Save vocals; complementary stems are computed after dereverb.
         vocals_path = stage_dir_1 / f"{base_name}_Vocals.wav"
         sf.write(str(vocals_path), vocals.T, sample_rate_out, format="WAV", subtype="FLOAT")
         logger.info("Saved: %s", vocals_path.name)
@@ -570,13 +572,13 @@ class SongCoverPipeline:
         logger.info("Saved: %s", noreverb_path.name)
 
         # ==================================================================
-        # Phase 3: Residual computation in STFT domain (fast + precise)
+        # Phase 3: Exact in-memory residual computation
         # ==================================================================
-        logger.info("--- Phase 3: STFT-domain residual computation ---")
-        instrumental, reverb = _compute_residuals_stft(
-            audio, vocals, noreverb, sr,
-            n_fft=2048, hop_length=512, win_length=2048,
-        )
+        # A residual is a linear time-domain subtraction.  Transforming all
+        # three tracks to STFT and back produces the same result up to
+        # reconstruction round-off, while adding substantial work.
+        logger.info("--- Phase 3: direct in-memory residual computation ---")
+        instrumental, reverb = compute_residuals(audio, vocals, noreverb)
 
         instrumental_path = stage_dir_1 / f"{base_name}_Instrumental.wav"
         sf.write(str(instrumental_path), instrumental.T, sample_rate_out, format="WAV", subtype="FLOAT")
@@ -917,33 +919,25 @@ def _compute_residual_stem(
     Path or None
     """
     import numpy as np
-    import librosa
     import soundfile as sf
 
     try:
-        input_audio, sr = librosa.load(str(input_file), sr=None, mono=False)
-        target_audio, _ = librosa.load(str(target_file), sr=None, mono=False)
+        input_audio, sr = sf.read(
+            str(input_file), dtype="float32", always_2d=True
+        )
+        target_audio, target_sr = sf.read(
+            str(target_file), dtype="float32", always_2d=True
+        )
+        input_audio = input_audio.T
+        target_audio = target_audio.T
 
-        # Normalize shapes to (channels, samples)
-        if input_audio.ndim == 1:
-            input_audio = np.expand_dims(input_audio, axis=0)
-        if target_audio.ndim == 1:
-            target_audio = np.expand_dims(target_audio, axis=0)
+        if target_sr != sr:
+            from src.msst_separator import _resample_fast
+            target_audio = _resample_fast(target_audio, target_sr, sr)
 
-        # Match channels
-        if input_audio.shape[0] != target_audio.shape[0]:
-            if input_audio.shape[0] == 1:
-                input_audio = np.repeat(input_audio, target_audio.shape[0], axis=0)
-            elif target_audio.shape[0] == 1:
-                target_audio = np.repeat(target_audio, input_audio.shape[0], axis=0)
-
-        # Align lengths
+        input_audio, target_audio = align_audio_pair(input_audio, target_audio)
         min_len = min(input_audio.shape[-1], target_audio.shape[-1])
-        input_audio = input_audio[:, :min_len]
-        target_audio = target_audio[:, :min_len]
-
-        # Compute residual
-        residual = input_audio - target_audio
+        residual = input_audio[:, :min_len] - target_audio[:, :min_len]
 
         # Write output
         stem = input_file.stem
@@ -960,89 +954,3 @@ def _find_residual_file(output_dir: Path, residual_name: str) -> Optional[Path]:
     """Find a residual stem file by name suffix."""
     candidates = sorted(output_dir.glob(f"*_{residual_name}.wav"))
     return candidates[0] if candidates else None
-
-
-def _compute_residuals_stft(
-    original: "np.ndarray",
-    vocals: "np.ndarray",
-    noreverb: "np.ndarray",
-    sample_rate: int,
-    n_fft: int = 2048,
-    hop_length: int = 512,
-    win_length: int = 2048,
-) -> tuple:
-    """
-    Compute instrumental and reverb residuals in the STFT domain.
-
-    instrumental = original - vocals   (complex STFT domain)
-    reverb       = vocals - noreverb   (complex STFT domain)
-
-    This is faster than time-domain subtraction because it avoids:
-      - librosa.load overhead for large WAV files
-      - Channel/length alignment logic
-      - Precision loss from resampling
-
-    Parameters
-    ----------
-    original : np.ndarray
-        Original audio (channels, samples).
-    vocals : np.ndarray
-        Vocals stem (channels, samples).
-    noreverb : np.ndarray
-        Dry vocals stem (channels, samples).
-    sample_rate : int
-        Sample rate (unused, accepted for interface compatibility).
-    n_fft, hop_length, win_length : int
-        STFT parameters.
-
-    Returns
-    -------
-    tuple of (instrumental, reverb) as numpy arrays.
-    """
-    import torch
-    import numpy as np
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    window = torch.hann_window(win_length, device=device)
-
-    def _stft(audio_np):
-        """Compute STFT for all channels → list of (freq, time) complex."""
-        audio_t = torch.from_numpy(audio_np.astype(np.float32)).to(device)
-        stfts = []
-        for ch in range(audio_t.shape[0]):
-            s = torch.stft(
-                audio_t[ch],
-                n_fft=n_fft, hop_length=hop_length, win_length=win_length,
-                window=window, return_complex=True,
-            )
-            stfts.append(s)
-        return stfts
-
-    def _istft(stft_list, length):
-        """iSTFT for all channels → (channels, samples) tensor."""
-        audios = []
-        for s in stft_list:
-            a = torch.istft(
-                s, n_fft=n_fft, hop_length=hop_length, win_length=win_length,
-                window=window, length=length,
-            )
-            audios.append(a)
-        return torch.stack(audios, dim=0)
-
-    stft_orig = _stft(original)
-    stft_voc = _stft(vocals)
-    stft_dry = _stft(noreverb)
-
-    # Align to minimum time frames
-    min_frames = min(s.shape[-1] for s in stft_orig + stft_voc + stft_dry)
-    stft_orig = [s[..., :min_frames] for s in stft_orig]
-    stft_voc = [s[..., :min_frames] for s in stft_voc]
-    stft_dry = [s[..., :min_frames] for s in stft_dry]
-
-    # Residuals in STFT domain (complex subtraction)
-    stft_inst = [o - v for o, v in zip(stft_orig, stft_voc)]
-    stft_rev = [v - d for v, d in zip(stft_voc, stft_dry)]
-
-    instrumental = _istft(stft_inst, original.shape[-1]).cpu().numpy()
-    reverb = _istft(stft_rev, vocals.shape[-1]).cpu().numpy()
-    return instrumental, reverb

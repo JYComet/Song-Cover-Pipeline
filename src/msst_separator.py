@@ -357,6 +357,13 @@ class MSSTSeparator:
                 continue
 
             wav = waveforms[stem_name]
+            model_sample_rate = int(
+                getattr(self._config.audio, "sample_rate", output_sample_rate)
+            )
+            if output_sample_rate != model_sample_rate:
+                wav = _resample_fast(
+                    wav, model_sample_rate, output_sample_rate
+                )
             out_path = output_dir / f"{base_name}_{stem_name}.wav"
             sf.write(
                 str(out_path), wav.T, output_sample_rate,
@@ -473,13 +480,13 @@ def _load_audio_fast(path: str) -> Tuple[np.ndarray, int]:
     This is 3-5x faster than librosa.load() when no resampling is needed,
     because librosa internally does format conversion even when sr=None.
     """
-    audio, sample_rate = sf.read(str(path))
+    audio, sample_rate = sf.read(str(path), dtype="float32")
     # soundfile returns (samples,) for mono or (samples, channels) for multi-channel
     if audio.ndim == 1:
         audio = np.expand_dims(audio, axis=0)
     else:
         audio = audio.T  # (samples, channels) -> (channels, samples)
-    return audio.astype(np.float32), sample_rate
+    return audio, sample_rate
 
 
 def _resample_fast(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
@@ -835,7 +842,7 @@ class LinkedMSSTSeparator:
 
         else:
             # ═══════════════════════════════════════════════════════
-            # Fallback: sequential separation + STFT-domain residuals
+            # Fallback: sequential separation + direct residuals
             # ═══════════════════════════════════════════════════════
             logger.info("LinkedMSST: Using sequential fallback (STFT params differ)")
             t1 = time.time()
@@ -848,9 +855,8 @@ class LinkedMSSTSeparator:
             noreverb = dereverb_waveforms["noreverb"]
             t_dereverb = time.time() - t2
 
-            instrumental, reverb = self._compute_residuals_stft(
-                audio, vocals, noreverb, sample_rate,
-            )
+            from src.audio_utils import compute_residuals
+            instrumental, reverb = compute_residuals(audio, vocals, noreverb)
             waveforms = {
                 'Vocals': vocals,
                 'noreverb': noreverb,
@@ -881,78 +887,6 @@ class LinkedMSSTSeparator:
             logger.info("Saved: %s (%.1fs)", out_path.name, duration)
 
         return saved
-
-    def _compute_residuals_stft(
-        self, original: np.ndarray, vocals: np.ndarray, noreverb: np.ndarray,
-        sample_rate: int,
-    ) -> tuple:
-        """
-        Compute instrumental and reverb residuals in the STFT domain.
-
-        instrumental = original - vocals   (in complex STFT domain)
-        reverb       = vocals - noreverb   (in complex STFT domain)
-
-        This is more precise than time-domain subtraction because it avoids
-        librosa resampling artifacts and channel/length alignment issues.
-        """
-        # Convert to torch tensors on GPU
-        orig_t = torch.from_numpy(original.astype(np.float32)).to(self.device)
-        voc_t = torch.from_numpy(vocals.astype(np.float32)).to(self.device)
-        dry_t = torch.from_numpy(noreverb.astype(np.float32)).to(self.device)
-
-        # STFT window
-        window = torch.hann_window(self._stft_win, device=self.device)
-
-        def _stft(audio_t):
-            """Compute STFT for all channels."""
-            stfts = []
-            for ch in range(audio_t.shape[0]):
-                s = torch.stft(
-                    audio_t[ch],
-                    n_fft=self._stft_n_fft,
-                    hop_length=self._stft_hop,
-                    win_length=self._stft_win,
-                    window=window,
-                    return_complex=True,
-                )
-                stfts.append(s)
-            return stfts  # list of (freq, time) complex tensors
-
-        def _istft(stft_list, length):
-            """iSTFT for all channels."""
-            audios = []
-            for s in stft_list:
-                a = torch.istft(
-                    s,
-                    n_fft=self._stft_n_fft,
-                    hop_length=self._stft_hop,
-                    win_length=self._stft_win,
-                    window=window,
-                    length=length,
-                )
-                audios.append(a)
-            return torch.stack(audios, dim=0)
-
-        # Compute STFTs
-        stft_orig = _stft(orig_t)
-        stft_voc = _stft(voc_t)
-        stft_dry = _stft(dry_t)
-
-        # Align STFT frames (use minimum time frames across all)
-        min_frames = min(s.shape[-1] for s in stft_orig + stft_voc + stft_dry)
-        stft_orig = [s[..., :min_frames] for s in stft_orig]
-        stft_voc = [s[..., :min_frames] for s in stft_voc]
-        stft_dry = [s[..., :min_frames] for s in stft_dry]
-
-        # Residuals in STFT domain
-        stft_inst = [o - v for o, v in zip(stft_orig, stft_voc)]
-        stft_rev = [v - d for v, d in zip(stft_voc, stft_dry)]
-
-        # iSTFT back to audio
-        instrumental = _istft(stft_inst, orig_t.shape[-1])
-        reverb = _istft(stft_rev, voc_t.shape[-1])
-
-        return instrumental.cpu().numpy(), reverb.cpu().numpy()
 
     def unload_models(self) -> None:
         """Release GPU memory for both models."""

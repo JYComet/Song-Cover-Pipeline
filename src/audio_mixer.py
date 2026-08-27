@@ -146,23 +146,15 @@ class AudioMixer:
         max_len = max(arr.shape[-1] for arr in processed)
         logger.info("Max track length: %.1fs", max_len / self.sample_rate)
 
-        aligned = []
+        mix = np.zeros((2, max_len), dtype=np.float32)
         for name, arr in zip(track_names, processed):
             if arr.shape[-1] < max_len:
-                # Zero-pad shorter tracks
                 pad_width = max_len - arr.shape[-1]
-                arr = np.pad(arr, ((0, 0), (0, pad_width)), mode="constant")
                 logger.info("  %s: padded %.1fs", name, pad_width / self.sample_rate)
-            elif arr.shape[-1] > max_len:
-                # Truncate longer tracks (shouldn't happen)
-                arr = arr[:, :max_len]
-                logger.info("  %s: truncated to %.1fs", name, max_len / self.sample_rate)
-            aligned.append(arr)
-
-        # ---- Sum tracks ----
-        mix = np.zeros_like(aligned[0])
-        for arr in aligned:
-            mix += arr
+            # Accumulating into the final buffer is equivalent to explicitly
+            # zero-padding every shorter track, but avoids one full-song array
+            # allocation and copy per track.
+            mix[:, : arr.shape[-1]] += arr
 
         # ---- Peak normalization ----
         peak = np.max(np.abs(mix))
@@ -233,16 +225,14 @@ class AudioMixer:
             processed.append(arr)
             logger.info("  %s: peak=%.2fdB, gain=%.1fdB", name, _peak_db(arr), gain_db)
 
-        # Align lengths
+        # Align and sum directly into the output buffer.  Avoid constructing a
+        # (track_count, channels, samples) temporary via np.sum.
         max_len = max(arr.shape[-1] for arr in processed)
-        aligned = []
+        mix = np.zeros((2, max_len), dtype=np.float32)
         for arr in processed:
-            if arr.shape[-1] < max_len:
-                arr = np.pad(arr, ((0, 0), (0, max_len - arr.shape[-1])), mode="constant")
-            aligned.append(arr)
+            mix[:, : arr.shape[-1]] += arr
 
-        # Sum and normalize
-        mix = np.sum(aligned, axis=0)
+        # Normalize
         peak = np.max(np.abs(mix))
         if self.normalize_output and peak > 0.0:
             if peak > 1.0:
@@ -274,15 +264,13 @@ class AudioMixer:
             raise FileNotFoundError(f"Track file not found: {path} ({label})")
 
         # Fast path: use soundfile for pure load (3-5x faster than librosa)
-        audio, sr = sf.read(str(path))
+        audio, sr = sf.read(str(path), dtype="float32")
 
         # Normalize shape: always (channels, samples)
         if audio.ndim == 1:
             audio = np.expand_dims(audio, axis=0)
         else:
             audio = audio.T  # (samples, channels) -> (channels, samples)
-        audio = audio.astype(np.float32)
-
         # Resample if needed
         if sr != self.sample_rate:
             logger.info(
